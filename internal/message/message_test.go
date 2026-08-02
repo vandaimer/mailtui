@@ -48,6 +48,43 @@ func TestBase64Body(t *testing.T) {
 	}
 }
 
+func TestParseHeaderFileDoesNotHydrateBody(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large")
+	writeMessage(t, path, "From: sender@example.com\r\nSubject: Lightweight\r\n\r\n"+strings.Repeat("x", 4*1024*1024))
+	parsed, err := ParseHeaderFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Subject != "Lightweight" || parsed.Body != "" || parsed.Loaded {
+		t.Fatalf("unexpected header result: %#v", parsed)
+	}
+}
+
+func BenchmarkHeaderVersusFullMessage(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "large")
+	contents := "From: sender@example.com\r\nSubject: Benchmark\r\n\r\n" + strings.Repeat("network-payload-", 512*1024)
+	if err := os.WriteFile(path, []byte(contents), 0o444); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("headers-only", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, err := ParseHeaderFile(path); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("complete-message", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, err := ParseFile(path); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func writeMessage(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o444); err != nil {

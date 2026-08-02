@@ -30,6 +30,9 @@ func TestDiscoverAndLoad(t *testing.T) {
 	if len(folders[0].Messages) != 1 || folders[0].Messages[0].Subject != "Backup" {
 		t.Fatalf("unexpected messages: %#v", folders[0].Messages)
 	}
+	if folders[0].Messages[0].Loaded || folders[0].Messages[0].Body != "" {
+		t.Fatalf("folder scan hydrated the body: %#v", folders[0].Messages[0])
+	}
 }
 
 func TestSortFolders(t *testing.T) {

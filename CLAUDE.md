@@ -42,6 +42,12 @@ messages. Tests are in `main_test.go`.
 The code is separated into `internal/maildir`, `internal/message`, and
 `internal/ui`, with the CLI in `main.go`.
 
+Network-mount performance is handled by two-phase asynchronous I/O. Folder
+scans concurrently read headers only; full bodies and attachments are loaded
+only for the selected message. Both folder and message selection are debounced,
+and all I/O runs as Bubble Tea commands rather than inside the event loop. Do
+not reintroduce synchronous folder parsing or full-file reads for list rows.
+
 ## User feedback and immediate product goal
 
 The initial user feedback was that the functional prototype was ugly and

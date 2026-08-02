@@ -56,10 +56,26 @@ The code is split across `internal/maildir`, `internal/message`, and
 - a styled responsive three/two/one-pane master-detail interface;
 - automatic selected-message previews and compact message snippets;
 - keyboard navigation and `/` filtering over subject and address headers.
+- asynchronous, debounced network I/O: concurrent header-only folder scans and
+  full MIME hydration only for the selected message.
 
 Tests alongside each internal package cover Maildir discovery and ordering,
 MIME parsing, attachments, HTML fallback, Base64 bodies, search interaction,
 selection-driven preview, and responsive rendering decisions.
+
+## I/O and performance architecture
+
+Maildirs may live on SMB/GVFS/network mounts. Never perform filesystem I/O from
+the Bubble Tea `Update` path. Folder selection emits a debounced command;
+`maildir.ScanHeaders` reads only RFC 822 headers with a fixed 12-worker limit.
+The UI stores those summaries in memory. Message selection emits a separate
+debounced command and calls `message.ParseFile` only for that one file. Loaded
+messages remain hydrated in memory while the application runs.
+
+Do not regress to `os.ReadFile` for every message in a folder. File managers
+appear fast because they list directory entries without parsing mail; this
+two-phase strategy keeps mail-specific metadata while avoiding full attachment
+downloads. A future persistent index must still live outside the Maildir.
 
 ## Current UX status
 

@@ -3,6 +3,7 @@
 package message
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"errors"
@@ -37,6 +38,23 @@ type Message struct {
 	Body        string
 	Attachments []Attachment
 	Err         error
+	Loaded      bool
+}
+
+// ParseHeaderFile reads only the RFC 822 headers. It deliberately leaves the
+// body on the backing filesystem, which keeps folder scans cheap on network
+// mounts. ParseFile can later hydrate the selected message.
+func ParseHeaderFile(path string) (Message, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Message{}, err
+	}
+	defer file.Close()
+	raw, err := mail.ReadMessage(bufio.NewReaderSize(file, 16*1024))
+	if err != nil {
+		return Message{}, err
+	}
+	return fromHeaders(path, raw.Header), nil
 }
 
 func ParseFile(path string) (Message, error) {
@@ -49,17 +67,8 @@ func ParseFile(path string) (Message, error) {
 		return Message{}, err
 	}
 
-	m := Message{Path: path}
-	m.From = decodeHeader(raw.Header.Get("From"))
-	m.To = decodeHeader(raw.Header.Get("To"))
-	m.Cc = decodeHeader(raw.Header.Get("Cc"))
-	m.Bcc = decodeHeader(raw.Header.Get("Bcc"))
-	m.Subject = decodeHeader(raw.Header.Get("Subject"))
-	m.MessageID = raw.Header.Get("Message-ID")
-	m.DateText = raw.Header.Get("Date")
-	if date, dateErr := mail.ParseDate(m.DateText); dateErr == nil {
-		m.Date = date
-	}
+	m := fromHeaders(path, raw.Header)
+	m.Loaded = true
 
 	body, err := io.ReadAll(raw.Body)
 	if err != nil {
@@ -87,6 +96,21 @@ func ParseFile(path string) (Message, error) {
 		m.Body = "[sem corpo de texto]"
 	}
 	return m, nil
+}
+
+func fromHeaders(path string, header mail.Header) Message {
+	m := Message{Path: path}
+	m.From = decodeHeader(header.Get("From"))
+	m.To = decodeHeader(header.Get("To"))
+	m.Cc = decodeHeader(header.Get("Cc"))
+	m.Bcc = decodeHeader(header.Get("Bcc"))
+	m.Subject = decodeHeader(header.Get("Subject"))
+	m.MessageID = header.Get("Message-ID")
+	m.DateText = header.Get("Date")
+	if date, dateErr := mail.ParseDate(m.DateText); dateErr == nil {
+		m.Date = date
+	}
+	return m
 }
 
 func decodeHeader(value string) string {

@@ -36,3 +36,12 @@ usuário em ordem natural. São exibidos headers principais, corpo `text/plain`
 (com fallback simples de HTML para texto) e metadados dos anexos MIME.
 Mensagens ilegíveis aparecem como inválidas, ajudando a verificar a integridade
 do backup sem interromper a navegação.
+
+## Backups em rede
+
+A navegação nunca espera por I/O no loop da interface. Ao selecionar uma pasta,
+o programa lê apenas os headers das mensagens, com concorrência limitada, e
+mantém o resultado em memória. O corpo MIME completo — incluindo anexos — só é
+lido para a mensagem selecionada. Pequenas pausas na seleção usam debounce para
+que atravessar rapidamente a lista de pastas ou mensagens não dispare leituras
+desnecessárias no ponto de montagem remoto.

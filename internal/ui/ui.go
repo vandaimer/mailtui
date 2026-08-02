@@ -26,6 +26,8 @@ const (
 const (
 	wideBreakpoint   = 112
 	mediumBreakpoint = 72
+	folderDebounce   = 180 * time.Millisecond
+	messageDebounce  = 120 * time.Millisecond
 )
 
 var (
@@ -56,22 +58,62 @@ type Model struct {
 	status                    string
 	searching                 bool
 	query, queryBeforeSearch  string
+	loadingFolder             string
+	loadingMessage            string
+	spinnerFrame              int
 }
 
 func New(root string, folders []maildir.Folder) Model {
-	m := Model{root: root, folders: folders, focus: foldersPane}
-	if len(m.folders) > 0 {
-		m.loadSelectedFolder()
-	}
-	return m
+	return Model{root: root, folders: folders, focus: foldersPane}
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+type folderLoadRequest struct{ path string }
+type folderLoaded struct {
+	path     string
+	messages []message.Message
+	err      error
+}
+type messageLoadRequest struct{ path string }
+type messageLoaded struct {
+	path    string
+	message message.Message
+	err     error
+}
+type spinnerTick struct{}
+
+func (m Model) Init() tea.Cmd {
+	return m.queueSelectedFolder(0)
+}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = value.Width, value.Height
+	case folderLoadRequest:
+		if value.path != m.selectedFolderPath() || m.selectedFolderLoaded() || m.loadingFolder == value.path {
+			return m, nil
+		}
+		m.loadingFolder = value.path
+		return m, tea.Batch(scanFolderCmd(value.path), spinnerCmd())
+	case folderLoaded:
+		m.storeFolderResult(value)
+		if value.path == m.selectedFolderPath() {
+			return m, m.queueSelectedMessage(0)
+		}
+	case messageLoadRequest:
+		selected := m.selectedMessage()
+		if selected == nil || selected.Path != value.path || selected.Loaded || selected.Err != nil || m.loadingMessage == value.path {
+			return m, nil
+		}
+		m.loadingMessage = value.path
+		return m, tea.Batch(loadMessageCmd(value.path), spinnerCmd())
+	case messageLoaded:
+		m.storeMessageResult(value)
+	case spinnerTick:
+		m.spinnerFrame++
+		if m.loadingFolder != "" || m.loadingMessage != "" {
+			return m, spinnerCmd()
+		}
 	case tea.KeyMsg:
 		if m.searching {
 			return m.updateSearch(value)
@@ -110,10 +152,11 @@ func (m Model) updateSearch(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.readerScroll = 0
 		}
 	}
-	return m, nil
+	return m, m.queueSelectedMessage(messageDebounce)
 }
 
 func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 	switch key.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -125,8 +168,10 @@ func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "tab":
 		m.focus = (m.focus + 1) % 3
+		cmd = m.ensureFocusedData()
 	case "shift+tab":
 		m.focus = (m.focus + 2) % 3
+		cmd = m.ensureFocusedData()
 	case "left", "h":
 		if m.focus > foldersPane {
 			m.focus--
@@ -134,6 +179,7 @@ func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "right", "l":
 		if m.focus < readerPane {
 			m.focus++
+			cmd = m.ensureFocusedData()
 		}
 	case "esc", "backspace":
 		if m.query != "" {
@@ -145,11 +191,12 @@ func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.focus < readerPane {
 			m.focus++
+			cmd = m.ensureFocusedData()
 		}
 	case "up", "k":
-		m.move(-1)
+		cmd = m.move(-1)
 	case "down", "j":
-		m.move(1)
+		cmd = m.move(1)
 	case "pgup":
 		if m.focus == readerPane {
 			m.readerScroll = max(0, m.readerScroll-max(1, m.readerViewportHeight()))
@@ -159,18 +206,18 @@ func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.readerScroll += max(1, m.readerViewportHeight())
 		}
 	case "home":
-		m.moveToBoundary(false)
+		cmd = m.moveToBoundary(false)
 	case "end":
-		m.moveToBoundary(true)
+		cmd = m.moveToBoundary(true)
 	}
-	return m, nil
+	return m, cmd
 }
 
-func (m *Model) move(delta int) {
+func (m *Model) move(delta int) tea.Cmd {
 	switch m.focus {
 	case foldersPane:
 		if len(m.folders) == 0 {
-			return
+			return nil
 		}
 		next := clamp(m.folderIndex+delta, 0, len(m.folders)-1)
 		if next != m.folderIndex {
@@ -178,20 +225,22 @@ func (m *Model) move(delta int) {
 			m.messageIndex = 0
 			m.readerScroll = 0
 			m.query = ""
-			m.loadSelectedFolder()
+			return m.queueSelectedFolder(folderDebounce)
 		}
 	case messagesPane:
 		matches := m.filteredMessageIndexes()
 		if len(matches) > 0 {
 			m.messageIndex = clamp(m.messageIndex+delta, 0, len(matches)-1)
 			m.readerScroll = 0
+			return m.queueSelectedMessage(messageDebounce)
 		}
 	case readerPane:
 		m.readerScroll = max(0, m.readerScroll+delta)
 	}
+	return nil
 }
 
-func (m *Model) moveToBoundary(end bool) {
+func (m *Model) moveToBoundary(end bool) tea.Cmd {
 	if m.focus == foldersPane && len(m.folders) > 0 {
 		if end {
 			m.folderIndex = len(m.folders) - 1
@@ -200,7 +249,7 @@ func (m *Model) moveToBoundary(end bool) {
 		}
 		m.messageIndex, m.readerScroll = 0, 0
 		m.query = ""
-		m.loadSelectedFolder()
+		return m.queueSelectedFolder(folderDebounce)
 	}
 	if m.focus == messagesPane {
 		matches := m.filteredMessageIndexes()
@@ -210,19 +259,104 @@ func (m *Model) moveToBoundary(end bool) {
 			m.messageIndex = 0
 		}
 		m.readerScroll = 0
+		return m.queueSelectedMessage(messageDebounce)
+	}
+	return nil
+}
+
+func (m Model) ensureFocusedData() tea.Cmd {
+	if !m.selectedFolderLoaded() {
+		return m.queueSelectedFolder(0)
+	}
+	if m.focus >= messagesPane {
+		return m.queueSelectedMessage(0)
+	}
+	return nil
+}
+
+func (m Model) queueSelectedFolder(delay time.Duration) tea.Cmd {
+	path := m.selectedFolderPath()
+	if path == "" || m.selectedFolderLoaded() {
+		return nil
+	}
+	return tea.Tick(delay, func(time.Time) tea.Msg { return folderLoadRequest{path: path} })
+}
+
+func (m Model) queueSelectedMessage(delay time.Duration) tea.Cmd {
+	selected := m.selectedMessage()
+	if selected == nil || selected.Path == "" || selected.Loaded || selected.Err != nil {
+		return nil
+	}
+	path := selected.Path
+	return tea.Tick(delay, func(time.Time) tea.Msg { return messageLoadRequest{path: path} })
+}
+
+func scanFolderCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		messages, err := maildir.ScanHeaders(path)
+		return folderLoaded{path: path, messages: messages, err: err}
 	}
 }
 
-func (m *Model) loadSelectedFolder() {
-	if len(m.folders) == 0 {
-		return
+func loadMessageCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		parsed, err := message.ParseFile(path)
+		return messageLoaded{path: path, message: parsed, err: err}
 	}
-	err := maildir.Load(&m.folders[m.folderIndex])
-	if err != nil {
+}
+
+func spinnerCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTick{} })
+}
+
+func (m *Model) storeFolderResult(result folderLoaded) {
+	for index := range m.folders {
+		if m.folders[index].Path == result.path {
+			m.folders[index].Messages = result.messages
+			break
+		}
+	}
+	if m.loadingFolder == result.path {
+		m.loadingFolder = ""
+	}
+	if result.err != nil {
 		m.status = "Algumas mensagens não puderam ser lidas"
-	} else {
+	} else if result.path == m.selectedFolderPath() {
 		m.status = ""
 	}
+}
+
+func (m *Model) storeMessageResult(result messageLoaded) {
+	for folderIndex := range m.folders {
+		for messageIndex := range m.folders[folderIndex].Messages {
+			if m.folders[folderIndex].Messages[messageIndex].Path != result.path {
+				continue
+			}
+			if result.err != nil {
+				m.folders[folderIndex].Messages[messageIndex].Err = result.err
+				m.folders[folderIndex].Messages[messageIndex].Loaded = true
+				m.folders[folderIndex].Messages[messageIndex].Body = "[não foi possível ler o conteúdo desta mensagem]"
+				m.status = "Não foi possível carregar uma mensagem"
+			} else {
+				m.folders[folderIndex].Messages[messageIndex] = result.message
+			}
+			break
+		}
+	}
+	if m.loadingMessage == result.path {
+		m.loadingMessage = ""
+	}
+}
+
+func (m Model) selectedFolderPath() string {
+	if len(m.folders) == 0 {
+		return ""
+	}
+	return m.folders[m.folderIndex].Path
+}
+
+func (m Model) selectedFolderLoaded() bool {
+	return len(m.folders) > 0 && m.folders[m.folderIndex].Messages != nil
 }
 
 func (m Model) filteredMessageIndexes() []int {
@@ -293,6 +427,11 @@ func (m Model) footerView() string {
 		return fitSides(left, right, m.width)
 	}
 	left := softStyle.Render("Tab/←→ foco  ↑↓ navegar  / buscar  Enter avançar  Esc voltar")
+	if m.loadingFolder != "" {
+		left = accentStyle.Render(m.spinner()+" Lendo headers…") + "  " + left
+	} else if m.loadingMessage != "" {
+		left = accentStyle.Render(m.spinner()+" Lendo mensagem…") + "  " + left
+	}
 	if m.status != "" {
 		left = lipgloss.NewStyle().Foreground(warning).Render("⚠ "+m.status) + "  " + left
 	}
@@ -343,6 +482,8 @@ func (m Model) folderPane(width, height int) string {
 		count := ""
 		if folder.Messages != nil {
 			count = fmt.Sprintf(" %d", len(folder.Messages))
+		} else if folder.Path == m.loadingFolder {
+			count = " " + m.spinner()
 		}
 		line := fitSides(truncate(name, max(1, width-8)), mutedStyle.Render(count), max(1, width-4))
 		if index == m.folderIndex {
@@ -360,6 +501,10 @@ func (m Model) folderPane(width, height int) string {
 }
 
 func (m Model) messagesPane(width, height int) string {
+	if !m.selectedFolderLoaded() {
+		lines := []string{"", accentStyle.Render(m.spinner() + " Carregando mensagens"), mutedStyle.Render("Lendo somente os headers do Maildir…")}
+		return paneBox("MENSAGENS", "", lines, width, height, m.focus == messagesPane)
+	}
 	matches := m.filteredMessageIndexes()
 	contentHeight := paneContentHeight(height)
 	rowsPerMessage := 3
@@ -380,7 +525,11 @@ func (m Model) messagesPane(width, height int) string {
 			available := max(10, width-4)
 			first := fitSides(truncate(displaySender(item.From), max(4, available-10)), displayDate(item.Date), available)
 			second := truncate(empty(item.Subject, "(sem assunto)"), available)
-			third := truncate(snippet(item.Body), available)
+			preview := snippet(item.Body)
+			if !item.Loaded {
+				preview = "Selecione para carregar a prévia"
+			}
+			third := truncate(preview, available)
 			if position == selected {
 				lines = append(lines,
 					fillStyle(selectedStyle, first, available),
@@ -401,11 +550,28 @@ func (m Model) messagesPane(width, height int) string {
 }
 
 func (m Model) readerPane(width, height int) string {
+	if !m.selectedFolderLoaded() {
+		lines := []string{"", accentStyle.Render(m.spinner() + " Preparando pasta"), mutedStyle.Render("A interface continua disponível durante a leitura.")}
+		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+	}
 	item := m.selectedMessage()
 	contentHeight := paneContentHeight(height)
 	available := max(10, width-4)
 	if item == nil {
 		lines := []string{"", accentStyle.Render("Nenhuma mensagem selecionada"), mutedStyle.Render("Escolha uma mensagem ou ajuste a busca.")}
+		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+	}
+	if item.Err != nil && !item.Loaded {
+		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Mensagem inválida"), mutedStyle.Render(truncate(item.Err.Error(), available))}
+		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+	}
+	if !item.Loaded {
+		lines := []string{
+			titleStyle.Render(truncate(empty(item.Subject, "(sem assunto)"), available)),
+		}
+		lines = append(lines, labelValue("De", item.From, available)...)
+		lines = append(lines, labelValue("Para", item.To, available)...)
+		lines = append(lines, "", accentStyle.Render(m.spinner()+" Carregando conteúdo…"), mutedStyle.Render("Somente este arquivo será lido por completo."))
 		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
 	}
 
@@ -483,6 +649,11 @@ func (m Model) folderMessageCount() int {
 		return 0
 	}
 	return len(m.folders[m.folderIndex].Messages)
+}
+
+func (m Model) spinner() string {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	return frames[m.spinnerFrame%len(frames)]
 }
 
 func labelValue(label, value string, width int) []string {

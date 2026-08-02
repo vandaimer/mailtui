@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"mailtui/internal/message"
@@ -76,10 +77,18 @@ func Load(folder *Folder) error {
 	if folder.Messages != nil {
 		return nil
 	}
-	folder.Messages = []message.Message{}
+	messages, err := ScanHeaders(folder.Path)
+	folder.Messages = messages
+	return err
+}
+
+// ScanHeaders lists cur/new and parses only message headers. Workers overlap
+// network latency, but the fixed cap avoids flooding remote filesystems.
+func ScanHeaders(folderPath string) ([]message.Message, error) {
+	var paths []string
 	var errs []error
 	for _, bucket := range []string{"cur", "new"} {
-		entries, err := os.ReadDir(filepath.Join(folder.Path, bucket))
+		entries, err := os.ReadDir(filepath.Join(folderPath, bucket))
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -88,19 +97,54 @@ func Load(folder *Folder) error {
 			if entry.IsDir() {
 				continue
 			}
-			path := filepath.Join(folder.Path, bucket, entry.Name())
-			parsed, parseErr := message.ParseFile(path)
-			if parseErr != nil {
-				parsed = message.Message{Path: path, Subject: "[mensagem inválida]", Err: parseErr}
-				errs = append(errs, fmt.Errorf("%s: %w", path, parseErr))
-			}
-			folder.Messages = append(folder.Messages, parsed)
+			paths = append(paths, filepath.Join(folderPath, bucket, entry.Name()))
 		}
 	}
-	sort.SliceStable(folder.Messages, func(i, j int) bool {
-		return folder.Messages[i].Date.After(folder.Messages[j].Date)
+	if len(paths) == 0 {
+		return []message.Message{}, errors.Join(errs...)
+	}
+
+	type result struct {
+		message message.Message
+		err     error
+	}
+	jobs := make(chan string)
+	results := make(chan result, len(paths))
+	workers := min(12, len(paths))
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for path := range jobs {
+				parsed, parseErr := message.ParseHeaderFile(path)
+				if parseErr != nil {
+					parsed = message.Message{Path: path, Subject: "[mensagem inválida]", Err: parseErr}
+				}
+				results <- result{message: parsed, err: parseErr}
+			}
+		}()
+	}
+	go func() {
+		for _, path := range paths {
+			jobs <- path
+		}
+		close(jobs)
+		group.Wait()
+		close(results)
+	}()
+
+	messages := make([]message.Message, 0, len(paths))
+	for parsed := range results {
+		messages = append(messages, parsed.message)
+		if parsed.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", parsed.message.Path, parsed.err))
+		}
+	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		return messages[i].Date.After(messages[j].Date)
 	})
-	return errors.Join(errs...)
+	return messages, errors.Join(errs...)
 }
 
 func SortFolders(folders []Folder) {
