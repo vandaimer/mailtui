@@ -14,7 +14,7 @@ import (
 	"mailtui/internal/attachment"
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
-	"mailtui/internal/metadata"
+	"mailtui/internal/readsession"
 )
 
 type pane int
@@ -62,10 +62,9 @@ type Model struct {
 	query, queryBeforeSearch  string
 	loadingFolder             string
 	refreshingFolder          string
-	refreshHadErrors          bool
 	loadingMessage            string
 	spinnerFrame              int
-	metadata                  *metadata.Store
+	reads                     readsession.Reader
 	attachmentPicker          bool
 	attachmentIndex           int
 	openingAttachment         bool
@@ -81,42 +80,14 @@ type bodyRenderKey struct {
 
 func New(root string, folders []maildir.Folder) Model {
 	return Model{
-		root: root, folders: folders, focus: foldersPane, metadata: metadata.New(root),
+		root: root, folders: folders, focus: foldersPane, reads: readsession.New(root),
 		bodyRenderCache: make(map[bodyRenderKey][]string),
 	}
 }
 
-type folderLoadRequest struct {
-	path  string
-	force bool
-}
-type folderLoaded struct {
-	path     string
-	messages []message.Message
-	err      error
-}
-type folderScanStarted struct {
-	path        string
-	fingerprint string
-	batches     <-chan maildir.HeaderBatch
-	err         error
-}
-type folderBatchReceived struct {
-	path        string
-	fingerprint string
-	batches     <-chan maildir.HeaderBatch
-	batch       maildir.HeaderBatch
-}
-type metadataSaved struct{ err error }
 type attachmentOpened struct {
 	path string
 	err  error
-}
-type messageLoadRequest struct{ path string }
-type messageLoaded struct {
-	path    string
-	message message.Message
-	err     error
 }
 type spinnerTick struct{}
 
@@ -131,65 +102,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.bodyRenderCache = make(map[bodyRenderKey][]string)
 		}
 		m.width, m.height = value.Width, value.Height
-	case folderLoadRequest:
-		if value.path != m.selectedFolderPath() {
-			if value.force && m.refreshingFolder == value.path {
+	case readsession.FolderRequest:
+		if value.Path != m.selectedFolderPath() {
+			if value.Refresh && m.refreshingFolder == value.Path {
 				m.refreshingFolder = ""
-				m.refreshHadErrors = false
 				m.status = "Folder refresh cancelled"
 			}
 			return m, nil
 		}
-		if (!value.force && m.selectedFolderLoaded()) || m.loadingFolder == value.path {
+		if (!value.Refresh && m.selectedFolderLoaded()) || m.loadingFolder == value.Path {
 			return m, nil
 		}
-		m.loadingFolder = value.path
-		return m, tea.Batch(startFolderScanCmd(value.path, m.metadata, value.force), spinnerCmd())
-	case folderLoaded:
-		m.storeFolderResult(value)
-		if value.path == m.selectedFolderPath() {
-			return m, m.queueSelectedMessage(0)
+		m.loadingFolder = value.Path
+		return m, tea.Batch(readFolderCmd(m.reader(), value), spinnerCmd())
+	case readsession.FolderUpdate:
+		if value.Stale {
+			return m, nil
 		}
-	case folderScanStarted:
-		if value.err != nil {
-			m.storeFolderResult(folderLoaded{path: value.path, messages: []message.Message{}, err: value.err})
-			if m.refreshingFolder == value.path {
+		path := value.Request.Path
+		if value.Fatal {
+			m.storeFolderResult(path, []message.Message{}, value.Err)
+			if m.refreshingFolder == path {
 				m.refreshingFolder = ""
-				m.refreshHadErrors = false
 				m.status = "Could not refresh the folder"
 			}
 			return m, nil
 		}
-		m.replaceFolderMessages(value.path, []message.Message{})
-		return m, nextFolderBatchCmd(value.path, value.fingerprint, value.batches)
-	case folderBatchReceived:
-		m.appendFolderBatch(value.path, value.batch)
-		if m.refreshingFolder == value.path && value.batch.Err != nil {
-			m.refreshHadErrors = true
+		if value.Started {
+			m.replaceFolderMessages(path, []message.Message{})
+			return m, readFolderCmd(m.reader(), value.Request)
 		}
-		if !value.batch.Done {
-			return m, nextFolderBatchCmd(value.path, value.fingerprint, value.batches)
+		m.replaceFolderMessages(path, value.Messages)
+		if value.Err != nil {
+			m.status = "Some messages could not be read"
 		}
-		if m.loadingFolder == value.path {
+		if !value.Done {
+			return m, readFolderCmd(m.reader(), value.Request)
+		}
+		if m.loadingFolder == path {
 			m.loadingFolder = ""
 		}
-		if m.refreshingFolder == value.path {
+		if m.refreshingFolder == path {
 			m.refreshingFolder = ""
-			if m.refreshHadErrors {
+			if value.HadReadErrors {
 				m.status = "Folder refreshed; some messages could not be read"
 			} else {
-				m.status = fmt.Sprintf("Folder refreshed: %d messages", len(m.folderMessages(value.path)))
+				m.status = fmt.Sprintf("Folder refreshed: %d messages", len(value.Messages))
 			}
-			m.refreshHadErrors = false
+		} else if path == m.selectedFolderPath() && !value.HadReadErrors {
+			m.status = ""
 		}
-		commands := []tea.Cmd{saveMetadataCmd(m.metadata, value.path, value.fingerprint, m.folderMessages(value.path))}
-		if value.path == m.selectedFolderPath() {
-			commands = append(commands, m.queueSelectedMessage(0))
-		}
-		return m, tea.Batch(commands...)
-	case metadataSaved:
-		if value.err != nil {
+		if value.CacheErr != nil {
 			m.status = "Could not update the local cache"
+		}
+		if path == m.selectedFolderPath() {
+			return m, m.queueSelectedMessage(0)
 		}
 	case attachmentOpened:
 		m.openingAttachment = false
@@ -198,14 +165,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status = "Attachment opened: " + filepath.Base(value.path)
 		}
-	case messageLoadRequest:
+	case readsession.MessageRequest:
 		selected := m.selectedMessage()
-		if selected == nil || selected.Path != value.path || selected.Loaded || selected.Err != nil || m.loadingMessage == value.path {
+		if selected == nil || selected.Path != value.Path || selected.Loaded || selected.Err != nil || m.loadingMessage == value.Path {
 			return m, nil
 		}
-		m.loadingMessage = value.path
-		return m, tea.Batch(loadMessageCmd(value.path), spinnerCmd())
-	case messageLoaded:
+		m.loadingMessage = value.Path
+		return m, tea.Batch(readMessageCmd(m.reader(), value), spinnerCmd())
+	case readsession.MessageUpdate:
+		if value.Stale {
+			return m, nil
+		}
 		m.storeMessageResult(value)
 	case spinnerTick:
 		m.spinnerFrame++
@@ -323,11 +293,10 @@ func (m Model) updateNavigation(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.refreshingFolder = path
-		m.refreshHadErrors = false
 		m.status = "Refreshing the selected folder"
 		m.messageIndex = 0
 		m.readerScroll = 0
-		cmd = refreshFolderCmd(path)
+		cmd = refreshFolderCmd(m.reader(), path)
 	case "tab":
 		m.focus = (m.focus + 1) % 3
 		cmd = m.ensureFocusedData()
@@ -441,11 +410,12 @@ func (m Model) queueSelectedFolder(delay time.Duration) tea.Cmd {
 	if path == "" || m.selectedFolderLoaded() {
 		return nil
 	}
-	return tea.Tick(delay, func(time.Time) tea.Msg { return folderLoadRequest{path: path} })
+	reader := m.reader()
+	return tea.Tick(delay, func(time.Time) tea.Msg { return reader.RequestFolder(path, false) })
 }
 
-func refreshFolderCmd(path string) tea.Cmd {
-	return func() tea.Msg { return folderLoadRequest{path: path, force: true} }
+func refreshFolderCmd(reader readsession.Reader, path string) tea.Cmd {
+	return func() tea.Msg { return reader.RequestFolder(path, true) }
 }
 
 func (m Model) queueSelectedMessage(delay time.Duration) tea.Cmd {
@@ -454,49 +424,19 @@ func (m Model) queueSelectedMessage(delay time.Duration) tea.Cmd {
 		return nil
 	}
 	path := selected.Path
-	return tea.Tick(delay, func(time.Time) tea.Msg { return messageLoadRequest{path: path} })
+	reader := m.reader()
+	return tea.Tick(delay, func(time.Time) tea.Msg { return reader.RequestMessage(path) })
 }
 
-func startFolderScanCmd(path string, store *metadata.Store, force bool) tea.Cmd {
+func readFolderCmd(reader readsession.Reader, request readsession.FolderRequest) tea.Cmd {
 	return func() tea.Msg {
-		paths, fingerprint, err := maildir.ListMessagePaths(path)
-		if err != nil {
-			return folderScanStarted{path: path, err: err}
-		}
-		if !force {
-			if messages, found := store.Load(path, fingerprint); found {
-				maildir.SortMessages(messages)
-				return folderLoaded{path: path, messages: messages}
-			}
-		}
-		return folderScanStarted{
-			path: path, fingerprint: fingerprint,
-			batches: maildir.ScanHeaderBatches(paths, 64),
-		}
+		return reader.ReadFolder(request)
 	}
 }
 
-func nextFolderBatchCmd(path, fingerprint string, batches <-chan maildir.HeaderBatch) tea.Cmd {
+func readMessageCmd(reader readsession.Reader, request readsession.MessageRequest) tea.Cmd {
 	return func() tea.Msg {
-		batch, ok := <-batches
-		if !ok {
-			batch = maildir.HeaderBatch{Done: true}
-		}
-		return folderBatchReceived{path: path, fingerprint: fingerprint, batches: batches, batch: batch}
-	}
-}
-
-func saveMetadataCmd(store *metadata.Store, path, fingerprint string, messages []message.Message) tea.Cmd {
-	snapshot := append([]message.Message(nil), messages...)
-	return func() tea.Msg {
-		return metadataSaved{err: store.Save(path, fingerprint, snapshot)}
-	}
-}
-
-func loadMessageCmd(path string) tea.Cmd {
-	return func() tea.Msg {
-		parsed, err := message.ParseFile(path)
-		return messageLoaded{path: path, message: parsed, err: err}
+		return reader.ReadMessage(request)
 	}
 }
 
@@ -514,14 +454,21 @@ func spinnerCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTick{} })
 }
 
-func (m *Model) storeFolderResult(result folderLoaded) {
-	m.replaceFolderMessages(result.path, result.messages)
-	if m.loadingFolder == result.path {
+func (m Model) reader() readsession.Reader {
+	if m.reads != nil {
+		return m.reads
+	}
+	return readsession.New(m.root)
+}
+
+func (m *Model) storeFolderResult(path string, messages []message.Message, err error) {
+	m.replaceFolderMessages(path, messages)
+	if m.loadingFolder == path {
 		m.loadingFolder = ""
 	}
-	if result.err != nil {
+	if err != nil {
 		m.status = "Some messages could not be read"
-	} else if result.path == m.selectedFolderPath() {
+	} else if path == m.selectedFolderPath() {
 		m.status = ""
 	}
 }
@@ -535,47 +482,24 @@ func (m *Model) replaceFolderMessages(path string, messages []message.Message) {
 	}
 }
 
-func (m *Model) appendFolderBatch(path string, batch maildir.HeaderBatch) {
-	for index := range m.folders {
-		if m.folders[index].Path != path {
-			continue
-		}
-		m.folders[index].Messages = append(m.folders[index].Messages, batch.Messages...)
-		maildir.SortMessages(m.folders[index].Messages)
-		break
-	}
-	if batch.Err != nil {
-		m.status = "Some messages could not be read"
-	}
-}
-
-func (m Model) folderMessages(path string) []message.Message {
-	for index := range m.folders {
-		if m.folders[index].Path == path {
-			return m.folders[index].Messages
-		}
-	}
-	return nil
-}
-
-func (m *Model) storeMessageResult(result messageLoaded) {
+func (m *Model) storeMessageResult(result readsession.MessageUpdate) {
 	for folderIndex := range m.folders {
 		for messageIndex := range m.folders[folderIndex].Messages {
-			if m.folders[folderIndex].Messages[messageIndex].Path != result.path {
+			if m.folders[folderIndex].Messages[messageIndex].Path != result.Request.Path {
 				continue
 			}
-			if result.err != nil {
-				m.folders[folderIndex].Messages[messageIndex].Err = result.err
+			if result.Err != nil {
+				m.folders[folderIndex].Messages[messageIndex].Err = result.Err
 				m.folders[folderIndex].Messages[messageIndex].Loaded = true
 				m.folders[folderIndex].Messages[messageIndex].Body = "[this message could not be loaded]"
 				m.status = "Could not load a message"
 			} else {
-				m.folders[folderIndex].Messages[messageIndex] = result.message
+				m.folders[folderIndex].Messages[messageIndex] = result.Message
 			}
 			break
 		}
 	}
-	if m.loadingMessage == result.path {
+	if m.loadingMessage == result.Request.Path {
 		m.loadingMessage = ""
 	}
 }

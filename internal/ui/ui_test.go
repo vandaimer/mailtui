@@ -2,8 +2,6 @@ package ui
 
 import (
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +11,7 @@ import (
 
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
-	"mailtui/internal/metadata"
+	"mailtui/internal/readsession"
 )
 
 func TestFilterMessagesSearchesHeaders(t *testing.T) {
@@ -150,21 +148,24 @@ func TestNewDefersAllFolderIO(t *testing.T) {
 }
 
 func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
+	reads := &stubReader{}
 	m := Model{
 		root:    "/network",
 		folders: []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}},
 		width:   130,
 		height:  32,
+		reads:   reads,
 	}
 
-	updated, cmd := m.Update(folderLoadRequest{path: "/network/INBOX"})
+	folderRequest := reads.RequestFolder("/network/INBOX", false)
+	updated, cmd := m.Update(folderRequest)
 	m = updated.(Model)
 	if cmd == nil || m.loadingFolder != "/network/INBOX" || m.folders[0].Messages != nil {
 		t.Fatalf("folder scan did not start asynchronously: %#v", m)
 	}
 
 	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header ready"}
-	updated, _ = m.Update(folderLoaded{path: "/network/INBOX", messages: []message.Message{summary}})
+	updated, _ = m.Update(readsession.FolderUpdate{Request: folderRequest, Messages: []message.Message{summary}, Done: true})
 	m = updated.(Model)
 	if m.loadingFolder != "" || len(m.folders[0].Messages) != 1 || m.folders[0].Messages[0].Loaded {
 		t.Fatalf("unexpected header phase: %#v", m)
@@ -173,14 +174,15 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 		t.Fatal("reader does not expose the deferred body load")
 	}
 
-	updated, cmd = m.Update(messageLoadRequest{path: summary.Path})
+	messageRequest := reads.RequestMessage(summary.Path)
+	updated, cmd = m.Update(messageRequest)
 	m = updated.(Model)
 	if cmd == nil || m.loadingMessage != summary.Path {
 		t.Fatalf("message load did not start asynchronously: %#v", m)
 	}
 	full := summary
 	full.Body, full.Loaded = "Content arrived", true
-	updated, _ = m.Update(messageLoaded{path: summary.Path, message: full})
+	updated, _ = m.Update(readsession.MessageUpdate{Request: messageRequest, Message: full})
 	m = updated.(Model)
 	if m.loadingMessage != "" || !strings.Contains(m.View().Content, "Content arrived") {
 		t.Fatalf("message was not hydrated: %#v", m)
@@ -188,7 +190,7 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 }
 
 func TestFolderNavigationIsDebounced(t *testing.T) {
-	m := Model{folders: []maildir.Folder{{Path: "/network/INBOX"}, {Path: "/network/Other"}}}
+	m := Model{folders: []maildir.Folder{{Path: "/network/INBOX"}, {Path: "/network/Other"}}, reads: &stubReader{}}
 	cmd := m.move(1)
 	if cmd == nil || m.folderIndex != 1 || m.folders[1].Messages != nil {
 		t.Fatalf("folder navigation blocked or eagerly loaded: %#v", m)
@@ -204,62 +206,27 @@ func TestRefreshKeyForcesSelectedFolderReload(t *testing.T) {
 	if cmd == nil || m.refreshingFolder != "/network/INBOX" || m.messageIndex != 0 {
 		t.Fatalf("refresh was not scheduled: %#v", m)
 	}
-	request, ok := cmd().(folderLoadRequest)
-	if !ok || request.path != "/network/INBOX" || !request.force {
+	request, ok := cmd().(readsession.FolderRequest)
+	if !ok || request.Path != "/network/INBOX" || !request.Refresh {
 		t.Fatalf("unexpected refresh request: %#v", request)
 	}
 }
 
-func TestForcedFolderScanBypassesMatchingCache(t *testing.T) {
-	folder := t.TempDir()
-	for _, bucket := range []string{"cur", "new", "tmp"} {
-		if err := os.Mkdir(filepath.Join(folder, bucket), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	messagePath := filepath.Join(folder, "new", "message")
-	if err := os.WriteFile(messagePath, []byte("From: Alice <alice@example.com>\r\nSubject: Fresh\r\nDate: Sun, 2 Aug 2026 12:00:00 +0200\r\n\r\nBody"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, fingerprint, err := maildir.ListMessagePaths(folder)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := metadata.NewAt(filepath.Join(t.TempDir(), "cache"))
-	if err := store.Save(folder, fingerprint, []message.Message{{Path: messagePath, Subject: "Stale"}}); err != nil {
-		t.Fatal(err)
-	}
-
-	cached := startFolderScanCmd(folder, store, false)()
-	if result, ok := cached.(folderLoaded); !ok || result.messages[0].Subject != "Stale" {
-		t.Fatalf("matching cache was not used: %#v", cached)
-	}
-	forced := startFolderScanCmd(folder, store, true)()
-	started, ok := forced.(folderScanStarted)
-	if !ok {
-		t.Fatalf("forced refresh did not bypass the cache: %#v", forced)
-	}
-	var refreshed []message.Message
-	for batch := range started.batches {
-		refreshed = append(refreshed, batch.Messages...)
-	}
-	if len(refreshed) != 1 || refreshed[0].Subject != "Fresh" {
-		t.Fatalf("forced refresh did not parse the file again: %#v", refreshed)
-	}
-}
-
 func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
+	reads := &stubReader{}
+	request := reads.RequestFolder("/network/INBOX", false)
 	m := Model{
 		folders:       []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{}}},
 		loadingFolder: "/network/INBOX",
+		reads:         reads,
 	}
-	first := maildir.HeaderBatch{Messages: []message.Message{{Path: "/network/INBOX/cur/1", Subject: "First batch"}}}
-	updated, _ := m.Update(folderBatchReceived{path: "/network/INBOX", batch: first})
+	first := readsession.FolderUpdate{Request: request, Messages: []message.Message{{Path: "/network/INBOX/cur/1", Subject: "First batch"}}}
+	updated, _ := m.Update(first)
 	m = updated.(Model)
 	if len(m.folders[0].Messages) != 1 || m.loadingFolder == "" {
 		t.Fatalf("first batch was not progressive: %#v", m)
 	}
-	updated, _ = m.Update(folderBatchReceived{path: "/network/INBOX", batch: maildir.HeaderBatch{Done: true}})
+	updated, _ = m.Update(readsession.FolderUpdate{Request: request, Messages: first.Messages, Done: true})
 	m = updated.(Model)
 	if m.loadingFolder != "" {
 		t.Fatalf("completed batch kept loading state: %#v", m)
@@ -267,13 +234,16 @@ func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
 }
 
 func TestRefreshCompletionKeepsReadErrorVisible(t *testing.T) {
+	reads := &stubReader{}
+	request := reads.RequestFolder("/network/INBOX", true)
 	m := Model{
 		folders:          []maildir.Folder{{Path: "/network/INBOX", Messages: []message.Message{}}},
 		loadingFolder:    "/network/INBOX",
 		refreshingFolder: "/network/INBOX",
+		reads:            reads,
 	}
-	batch := maildir.HeaderBatch{Err: errors.New("permission denied"), Done: true}
-	updated, _ := m.Update(folderBatchReceived{path: "/network/INBOX", batch: batch})
+	batch := readsession.FolderUpdate{Request: request, Err: errors.New("permission denied"), HadReadErrors: true, Done: true}
+	updated, _ := m.Update(batch)
 	m = updated.(Model)
 	if m.refreshingFolder != "" || !strings.Contains(m.status, "some messages could not be read") {
 		t.Fatalf("refresh error was hidden: %#v", m)
@@ -304,5 +274,25 @@ func testModel() Model {
 			{From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local), Loaded: true},
 		},
 	}}
-	return Model{root: "/backup/mail", folders: folders, width: 130, height: 32}
+	return Model{root: "/backup/mail", folders: folders, width: 130, height: 32, reads: &stubReader{}}
+}
+
+type stubReader struct{ next readsession.RequestID }
+
+func (reader *stubReader) RequestFolder(path string, refresh bool) readsession.FolderRequest {
+	reader.next++
+	return readsession.FolderRequest{ID: reader.next, Path: path, Refresh: refresh}
+}
+
+func (reader *stubReader) ReadFolder(request readsession.FolderRequest) readsession.FolderUpdate {
+	return readsession.FolderUpdate{Request: request, Done: true}
+}
+
+func (reader *stubReader) RequestMessage(path string) readsession.MessageRequest {
+	reader.next++
+	return readsession.MessageRequest{ID: reader.next, Path: path}
+}
+
+func (reader *stubReader) ReadMessage(request readsession.MessageRequest) readsession.MessageUpdate {
+	return readsession.MessageUpdate{Request: request}
 }
