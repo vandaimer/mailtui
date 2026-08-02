@@ -1,6 +1,9 @@
 package ui
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +13,7 @@ import (
 
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
+	"mailtui/internal/metadata"
 )
 
 func TestFilterMessagesSearchesHeaders(t *testing.T) {
@@ -164,6 +168,59 @@ func TestFolderNavigationIsDebounced(t *testing.T) {
 	}
 }
 
+func TestRefreshKeyForcesSelectedFolderReload(t *testing.T) {
+	m := testModel()
+	m.folders[0].Path = "/network/INBOX"
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	m = updated.(Model)
+	if cmd == nil || m.refreshingFolder != "/network/INBOX" || m.messageIndex != 0 {
+		t.Fatalf("refresh was not scheduled: %#v", m)
+	}
+	request, ok := cmd().(folderLoadRequest)
+	if !ok || request.path != "/network/INBOX" || !request.force {
+		t.Fatalf("unexpected refresh request: %#v", request)
+	}
+}
+
+func TestForcedFolderScanBypassesMatchingCache(t *testing.T) {
+	folder := t.TempDir()
+	for _, bucket := range []string{"cur", "new", "tmp"} {
+		if err := os.Mkdir(filepath.Join(folder, bucket), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messagePath := filepath.Join(folder, "new", "message")
+	if err := os.WriteFile(messagePath, []byte("From: Alice <alice@example.com>\r\nSubject: Fresh\r\nDate: Sun, 2 Aug 2026 12:00:00 +0200\r\n\r\nBody"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, fingerprint, err := maildir.ListMessagePaths(folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := metadata.NewAt(filepath.Join(t.TempDir(), "cache"))
+	if err := store.Save(folder, fingerprint, []message.Message{{Path: messagePath, Subject: "Stale"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	cached := startFolderScanCmd(folder, store, false)()
+	if result, ok := cached.(folderLoaded); !ok || result.messages[0].Subject != "Stale" {
+		t.Fatalf("matching cache was not used: %#v", cached)
+	}
+	forced := startFolderScanCmd(folder, store, true)()
+	started, ok := forced.(folderScanStarted)
+	if !ok {
+		t.Fatalf("forced refresh did not bypass the cache: %#v", forced)
+	}
+	var refreshed []message.Message
+	for batch := range started.batches {
+		refreshed = append(refreshed, batch.Messages...)
+	}
+	if len(refreshed) != 1 || refreshed[0].Subject != "Fresh" {
+		t.Fatalf("forced refresh did not parse the file again: %#v", refreshed)
+	}
+}
+
 func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
 	m := Model{
 		folders:       []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{}}},
@@ -179,6 +236,20 @@ func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
 	m = updated.(Model)
 	if m.loadingFolder != "" {
 		t.Fatalf("completed batch kept loading state: %#v", m)
+	}
+}
+
+func TestRefreshCompletionKeepsReadErrorVisible(t *testing.T) {
+	m := Model{
+		folders:          []maildir.Folder{{Path: "/network/INBOX", Messages: []message.Message{}}},
+		loadingFolder:    "/network/INBOX",
+		refreshingFolder: "/network/INBOX",
+	}
+	batch := maildir.HeaderBatch{Err: errors.New("permission denied"), Done: true}
+	updated, _ := m.Update(folderBatchReceived{path: "/network/INBOX", batch: batch})
+	m = updated.(Model)
+	if m.refreshingFolder != "" || !strings.Contains(m.status, "some messages could not be read") {
+		t.Fatalf("refresh error was hidden: %#v", m)
 	}
 }
 

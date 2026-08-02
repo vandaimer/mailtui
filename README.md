@@ -148,6 +148,7 @@ data inside the Maildir.
 | --- | --- |
 | `↑` / `↓` or `j` / `k` | Navigate the focused pane |
 | `Tab` / `Shift+Tab` | Move between folders, messages, and reader |
+| `r` | Refresh the selected folder, bypassing its metadata cache |
 | `←` / `→` or `h` / `l` | Move between panes |
 | `/` | Search subject, sender, and recipients |
 | `Enter` | Apply search or move to the next pane |
