@@ -144,6 +144,49 @@ func TestViewFillsTerminalWithStatusMessage(t *testing.T) {
 	}
 }
 
+func TestHeaderAndFooterKeepLayoutChromeToOneLine(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Model)
+	}{
+		{
+			name: "maildir root",
+			mutate: func(m *Model) {
+				m.root = "/backup/mail\nwith-newline"
+			},
+		},
+		{
+			name: "pasted search",
+			mutate: func(m *Model) {
+				m.searching = true
+				m.query = "alice\nbilling@example.com"
+			},
+		},
+		{
+			name: "status error",
+			mutate: func(m *Model) {
+				m.status = "read failed\npermission denied"
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := testModel()
+			test.mutate(&m)
+			if got := lipgloss.Height(m.headerView()); got != 1 {
+				t.Fatalf("header height = %d", got)
+			}
+			if got := lipgloss.Height(m.footerView()); got != 1 {
+				t.Fatalf("footer height = %d", got)
+			}
+			if got := lipgloss.Height(m.View().Content); got != m.height {
+				t.Fatalf("view height = %d, want %d", got, m.height)
+			}
+		})
+	}
+}
+
 func TestMessageSelectionUpdatesPreview(t *testing.T) {
 	m := testModel()
 	m.focus = messagesPane

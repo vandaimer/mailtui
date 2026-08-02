@@ -591,8 +591,9 @@ func (m Model) viewContent() string {
 
 func (m Model) headerView() string {
 	brand := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(accentStrong).Padding(0, 1).Render("MAILTUI")
-	root := softStyle.Render("  " + filepath.Base(m.root))
 	readonly := lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("READ ONLY")
+	rootWidth := max(1, m.width-lipgloss.Width(brand)-lipgloss.Width(readonly)-1)
+	root := softStyle.Render(truncate("  "+singleLine(filepath.Base(m.root)), rootWidth))
 	gap := max(1, m.width-lipgloss.Width(brand)-lipgloss.Width(root)-lipgloss.Width(readonly))
 	return brand + root + strings.Repeat(" ", gap) + readonly
 }
@@ -603,8 +604,10 @@ func (m Model) footerView() string {
 	}
 	if m.searching {
 		count := len(m.filteredMessageIndexes())
-		left := accentStyle.Render(" / ") + lipgloss.NewStyle().Foreground(textColor).Render(m.query+"█")
+		prefix := accentStyle.Render(" / ")
 		right := mutedStyle.Render(fmt.Sprintf("%d result(s)  Enter apply  Esc cancel", count))
+		queryWidth := max(1, m.width-lipgloss.Width(prefix)-lipgloss.Width(right)-1)
+		left := prefix + lipgloss.NewStyle().Foreground(textColor).Render(truncate(singleLine(m.query)+"█", queryWidth))
 		return fitSides(left, right, m.width)
 	}
 	left := softStyle.Render("Tab/←→ focus  ↑↓ navigate  / search  r refresh  v view  o attachments  Esc back")
@@ -620,7 +623,7 @@ func (m Model) footerView() string {
 		left = accentStyle.Render(m.spinner()+" Opening attachment…") + "  " + left
 	}
 	if m.status != "" {
-		left = lipgloss.NewStyle().Foreground(warning).Render("⚠ "+m.status) + "  " + left
+		left = lipgloss.NewStyle().Foreground(warning).Render("⚠ "+singleLine(m.status)) + "  " + left
 	}
 	right := mutedStyle.Render("q quit")
 	return fitSides(left, right, m.width)
@@ -956,8 +959,12 @@ func displayDate(value time.Time) string {
 }
 
 func snippet(value string) string {
-	clean := strings.Join(strings.Fields(value), " ")
+	clean := singleLine(value)
 	return empty(clean, "No text preview")
+}
+
+func singleLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func formatBytes(size int) string {
@@ -986,7 +993,7 @@ func truncate(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(strings.Join(strings.Fields(value), " "))
+	runes := []rune(singleLine(value))
 	if len(runes) <= width {
 		return string(runes)
 	}
