@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"html"
 	"io"
 	"mime"
@@ -96,6 +97,94 @@ func ParseFile(path string) (Message, error) {
 		m.Body = "[sem corpo de texto]"
 	}
 	return m, nil
+}
+
+// ExtractAttachment returns one decoded MIME attachment by the same order used
+// in Message.Attachments. It performs no writes.
+func ExtractAttachment(path string, target int) (Attachment, []byte, error) {
+	if target < 0 {
+		return Attachment{}, nil, errors.New("índice de anexo inválido")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Attachment{}, nil, err
+	}
+	raw, err := mail.ReadMessage(bytes.NewReader(data))
+	if err != nil {
+		return Attachment{}, nil, err
+	}
+	body, err := io.ReadAll(raw.Body)
+	if err != nil {
+		return Attachment{}, nil, err
+	}
+	body, err = decodeTransfer(body, raw.Header.Get("Content-Transfer-Encoding"))
+	if err != nil {
+		return Attachment{}, nil, err
+	}
+	mediaType, params, _ := mime.ParseMediaType(raw.Header.Get("Content-Type"))
+	if mediaType == "" {
+		mediaType = "text/plain"
+	}
+	seen := 0
+	attachment, payload, found, err := findAttachment(mediaType, params, body, target, &seen)
+	if err != nil {
+		return Attachment{}, nil, err
+	}
+	if !found {
+		return Attachment{}, nil, fmt.Errorf("anexo %d não encontrado", target+1)
+	}
+	return attachment, payload, nil
+}
+
+func findAttachment(mediaType string, params map[string]string, data []byte, target int, seen *int) (Attachment, []byte, bool, error) {
+	if !strings.HasPrefix(mediaType, "multipart/") {
+		return Attachment{}, nil, false, nil
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		return Attachment{}, nil, false, errors.New("multipart sem boundary")
+	}
+	reader := multipart.NewReader(bytes.NewReader(data), boundary)
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			return Attachment{}, nil, false, nil
+		}
+		if err != nil {
+			return Attachment{}, nil, false, err
+		}
+		partData, err := io.ReadAll(part)
+		if err != nil {
+			return Attachment{}, nil, false, err
+		}
+		partData, err = decodeTransfer(partData, part.Header.Get("Content-Transfer-Encoding"))
+		if err != nil {
+			return Attachment{}, nil, false, err
+		}
+		partType, partParams, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		if partType == "" {
+			partType = "text/plain"
+		}
+		disposition, dispositionParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+		filename := decodeHeader(dispositionParams["filename"])
+		if filename == "" {
+			filename = decodeHeader(partParams["name"])
+		}
+		if disposition == "attachment" || filename != "" {
+			if filename == "" {
+				filename = "anexo-sem-nome"
+			}
+			if *seen == target {
+				return Attachment{Name: filename, MediaType: partType, Size: len(partData)}, partData, true, nil
+			}
+			*seen++
+			continue
+		}
+		attachment, payload, found, nestedErr := findAttachment(partType, partParams, partData, target, seen)
+		if nestedErr != nil || found {
+			return attachment, payload, found, nestedErr
+		}
+	}
 }
 
 func fromHeaders(path string, header mail.Header) Message {

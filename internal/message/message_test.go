@@ -22,6 +22,13 @@ func TestParseMultipartMessage(t *testing.T) {
 	if len(parsed.Attachments) != 1 || parsed.Attachments[0].Name != "invoice.pdf" {
 		t.Fatalf("unexpected attachments: %#v", parsed.Attachments)
 	}
+	attachment, payload, err := ExtractAttachment(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.Name != "invoice.pdf" || string(payload) != "PDFDATA" {
+		t.Fatalf("unexpected extracted attachment: %#v %q", attachment, payload)
+	}
 }
 
 func TestHTMLFallback(t *testing.T) {
