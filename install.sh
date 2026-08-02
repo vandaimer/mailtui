@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repository=${MAILTUI_REPO:-}
+repository=${MAILTUI_REPO:-vandaimer/mailtui}
 version=${MAILTUI_VERSION:-latest}
 install_dir=${MAILTUI_INSTALL_DIR:-"${HOME}/.local/bin"}
 
@@ -10,10 +10,10 @@ usage() {
 Install a prebuilt mailtui release from GitHub.
 
 Usage:
-  install.sh --repo OWNER/REPOSITORY [--version vX.Y.Z] [--dir PATH]
+  install.sh [--version vX.Y.Z] [--dir PATH] [--repo OWNER/REPOSITORY]
 
 Environment variables:
-  MAILTUI_REPO         GitHub repository in OWNER/REPOSITORY form
+  MAILTUI_REPO         GitHub repository (default: vandaimer/mailtui)
   MAILTUI_VERSION      Release tag, or "latest" (default)
   MAILTUI_INSTALL_DIR  Destination directory (default: ~/.local/bin)
 EOF
@@ -48,7 +48,7 @@ done
 case "$repository" in
   */*) ;;
   *)
-    echo "--repo OWNER/REPOSITORY is required" >&2
+    echo "invalid repository; expected OWNER/REPOSITORY" >&2
     exit 2
     ;;
 esac
@@ -94,6 +94,7 @@ download() {
   fi
 }
 
+echo "Downloading mailtui ${version} for ${target_os}/${target_arch}..."
 download "$base_url/$asset" "$temporary_dir/$asset"
 download "$base_url/checksums.txt" "$temporary_dir/checksums.txt"
 
@@ -103,10 +104,14 @@ if [ -z "$expected" ]; then
   exit 1
 fi
 
+echo "Verifying SHA-256 checksum..."
 if command -v sha256sum >/dev/null 2>&1; then
   actual=$(sha256sum "$temporary_dir/$asset" | awk '{ print $1 }')
-else
+elif command -v shasum >/dev/null 2>&1; then
   actual=$(shasum -a 256 "$temporary_dir/$asset" | awk '{ print $1 }')
+else
+  echo "sha256sum or shasum is required to verify the download" >&2
+  exit 1
 fi
 
 if [ "$actual" != "$expected" ]; then

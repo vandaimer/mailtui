@@ -1,92 +1,178 @@
 # mailtui
 
-A fast, offline, **read-only** TUI for browsing email backups stored in Maildir
-format. The root may contain multiple folders or labels; every directory with
-`cur/`, `new/`, and `tmp/` is discovered automatically.
+`mailtui` is a fast, offline, read-only terminal application for browsing email
+backups stored in Maildir format.
 
-## Usage
+Point it at the root of an `mbsync`/`isync` backup and it automatically finds
+all Maildir folders below it. No Gmail connection, OAuth token, IMAP server, or
+SMTP configuration is required.
+
+## Features
+
+- Browse folders, messages, and the selected email in a responsive interface.
+- Search the current folder by subject, sender, or recipient.
+- Read common RFC 822 and MIME messages, including encoded headers and bodies.
+- See attachment names, types, and sizes, then open them with the default app.
+- Navigate large backups on local or network-mounted filesystems without
+  blocking the interface.
+- Keep the original Maildir strictly read-only. mailtui never changes messages,
+  flags, folders, or files inside the backup.
+
+## Install
+
+### Linux and macOS
+
+Run the installer:
 
 ```sh
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o mailtui .
-./mailtui /mnt/mail
+curl -fsSL https://raw.githubusercontent.com/vandaimer/mailtui/master/install.sh | sh
 ```
 
-Install a published release on Linux or macOS:
+It downloads the latest binary for your operating system and architecture,
+verifies its SHA-256 checksum, and installs it to `~/.local/bin/mailtui`.
+
+If `~/.local/bin` is not already in your `PATH`, add it to your shell:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/mailtui/main/install.sh | \
-  sh -s -- --repo OWNER/mailtui
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The installer detects the operating system and architecture, verifies the
-release checksum, and installs to `~/.local/bin` by default. Use `--dir PATH`,
-`--version vX.Y.Z`, or the corresponding `MAILTUI_*` environment variables to
-override its settings.
+To install a particular version or choose another directory:
 
-The build produces a single static executable with no project runtime or
-libraries to install. The application does not access Gmail, OAuth, IMAP, or
-SMTP. It only lists directories and reads messages from `cur/` and `new/`;
-`tmp/` is used solely to recognize the Maildir structure.
+```sh
+curl -fsSL https://raw.githubusercontent.com/vandaimer/mailtui/master/install.sh | \
+  sh -s -- --version v0.1.0 --dir "$HOME/bin"
+```
 
-On wide terminals, the interface displays folders, messages, and the selected
-email preview at the same time. On medium widths, the message list and reader
-are stacked. On narrow terminals, each pane takes over the screen to remain
-legible.
+### Windows
 
-Keys:
+Download the appropriate `mailtui_windows_*.zip` file from the
+[latest release](https://github.com/vandaimer/mailtui/releases/latest), extract
+`mailtui.exe`, and place it in a directory included in your `PATH`.
 
-- `↑/↓` or `j/k`: navigate the focused pane;
-- `Tab`, `Shift+Tab`, `←/→`, or `h/l`: change focus;
-- `/`: search by subject, sender, or recipients;
-- `Enter`: apply the search or move to the next pane;
-- `Esc`: cancel search, clear the filter, or go back;
-- `PgUp/PgDn`: scroll the message body;
-- `o`: select and open an attachment with the default application;
-- `q`: quit.
+Then open PowerShell or Windows Terminal and run:
 
-`INBOX` is listed first, followed by Gmail/system folders and user labels in
-natural order. The reader displays important headers, the `text/plain` body
-(with a basic HTML-to-text fallback), and MIME attachment metadata. Unreadable
-messages remain visible as invalid entries, which helps verify backup integrity
-without interrupting navigation.
+```powershell
+mailtui.exe 'C:\path\to\mail'
+```
 
-## Network backups
+### Build from source
 
-Navigation never waits for filesystem I/O in the interface event loop. When a
-folder is selected, mailtui reads only message headers with bounded concurrency
-and keeps the results in memory. The complete MIME body—including attachment
-payloads—is read only for the selected message. Selection is debounced so that
-moving quickly through folders or messages does not trigger unnecessary reads
-from a remote mount.
+Go 1.26.1 or newer is required:
 
-During the first folder scan, headers appear progressively in batches. When the
-scan completes, mailtui stores only those metadata summaries under
-`${XDG_CACHE_HOME:-~/.cache}/mailtui/metadata-v1/`. On later runs it compares
-the Maildir filename list and reuses the cache when nothing changed. No index or
-cache is ever created inside the backup.
+```sh
+git clone https://github.com/vandaimer/mailtui.git
+cd mailtui
+go build -trimpath -o mailtui .
+./mailtui /path/to/mail
+```
+
+## Open a backup
+
+Pass the root directory containing your Maildir folders:
+
+```sh
+mailtui /mnt/mail
+```
+
+Other examples:
+
+```sh
+mailtui ~/.local/share/mail/mbsync
+mailtui '/run/user/1000/gvfs/smb-share:server=nas,share=mail'
+```
+
+The expected layout looks like this:
+
+```text
+mail/
+├── INBOX/
+│   ├── cur/
+│   ├── new/
+│   └── tmp/
+├── Receipts/
+│   ├── cur/
+│   ├── new/
+│   └── tmp/
+└── [Gmail]/
+    └── Sent Mail/
+        ├── cur/
+        ├── new/
+        └── tmp/
+```
+
+Pass `mail/`, not an individual message file. Every nested directory containing
+`cur/`, `new/`, and `tmp/` is detected as a folder. `INBOX` is shown first,
+followed by Gmail system folders and regular labels.
+
+## Controls
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` or `j` / `k` | Navigate the focused pane |
+| `Tab` / `Shift+Tab` | Move between folders, messages, and reader |
+| `←` / `→` or `h` / `l` | Move between panes |
+| `/` | Search subject, sender, and recipients |
+| `Enter` | Apply search or move to the next pane |
+| `Esc` | Cancel search, clear the filter, or go back |
+| `PgUp` / `PgDn` | Scroll the message body |
+| `o` | Open the attachment picker |
+| `q` | Quit |
+
+The layout adapts to the terminal width. Wide terminals show all three panes;
+medium terminals stack the message list and reader; narrow terminals show one
+focused pane at a time.
 
 ## Attachments
 
-Once a message has loaded, press `o`, select an attachment, and press `Enter`.
-The payload is decoded into
-`${XDG_CACHE_HOME:-~/.cache}/mailtui/attachments/` with restricted permissions
-and opened through the platform's default application. For example, a PDF opens
-in the default PDF viewer. Original Maildir files remain untouched.
+Open a message and press `o`. Select an attachment with `↑`/`↓` or `j`/`k`,
+then press `Enter`. PDFs, images, and other files are opened with the default
+application configured on your system.
 
-## Releases
+Attachments are decoded only after you explicitly open them. Temporary copies
+are stored under:
 
-Run the release workflow manually from **Actions → Release → Run workflow** and
-enter a `vX.Y.Z` version. The workflow creates the tag and GitHub release from
-the selected branch. Pushing a `vX.Y.Z` tag remains supported as an alternative.
-
-Both paths test the project, build static binaries for Linux, macOS, and Windows
-on amd64 and arm64, write SHA-256 checksums, and create a GitHub release with
-generated notes.
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
+```text
+${XDG_CACHE_HOME:-~/.cache}/mailtui/attachments/
 ```
 
-The regular CI workflow checks formatting, runs the race-enabled test suite and
-`go vet`, and verifies a static build on every push and pull request.
+The files receive restricted permissions, and nothing is written into the
+Maildir backup.
+
+## Large and network-mounted backups
+
+mailtui initially reads message headers only. Full MIME content and attachments
+are loaded when a message is selected, while folder headers appear progressively
+in small batches.
+
+Reusable header metadata is stored outside the backup under:
+
+```text
+${XDG_CACHE_HOME:-~/.cache}/mailtui/metadata-v1/
+```
+
+If a folder has not changed, the next visit reuses that cache. Deleting the
+cache is safe; mailtui recreates it when needed.
+
+## Current email rendering
+
+mailtui prefers the `text/plain` MIME body. If a message only contains HTML, it
+converts that content to basic readable text. Rich HTML formatting and remote
+images are not currently rendered.
+
+Unreadable or malformed messages remain visible as invalid entries so you can
+inspect the integrity of the backup without interrupting navigation.
+
+## Uninstall
+
+If you used the default installer location:
+
+```sh
+rm "$HOME/.local/bin/mailtui"
+```
+
+You may also remove the optional cache directory:
+
+```sh
+rm -r "${XDG_CACHE_HOME:-$HOME/.cache}/mailtui"
+```
