@@ -60,6 +60,16 @@ func TestResponsiveViews(t *testing.T) {
 	if got := lipgloss.Width(wide); got != 130 {
 		t.Fatalf("wide view width = %d", got)
 	}
+	if got := lipgloss.Height(wide); got != 32 {
+		t.Fatalf("wide view height = %d", got)
+	}
+	wideBody := m.wideView(130, 30)
+	if got := lipgloss.Width(wideBody); got != 130 {
+		t.Fatalf("wide body width = %d", got)
+	}
+	if got := lipgloss.Height(wideBody); got != 30 {
+		t.Fatalf("wide body height = %d", got)
+	}
 	for _, label := range []string{"FOLDERS", "INBOX", "READER", "First message", "Alice's message body"} {
 		if !strings.Contains(wide, label) {
 			t.Fatalf("wide view missing %q", label)
@@ -78,6 +88,23 @@ func TestResponsiveViews(t *testing.T) {
 	narrow = m.View().Content
 	if !strings.Contains(narrow, "READER") || !strings.Contains(narrow, "Alice's message body") {
 		t.Fatalf("unexpected narrow reader view")
+	}
+}
+
+func TestViewFillsTerminalWithStatusMessage(t *testing.T) {
+	for _, width := range []int{60, 90, 130} {
+		m := testModel()
+		m.width, m.height = width, 32
+		m.status = "The selected message has no attachments"
+		view := m.View().Content
+		if got := lipgloss.Height(view); got != m.height {
+			t.Errorf("width %d: view height = %d, want %d", width, got, m.height)
+		}
+		for index, line := range strings.Split(view, "\n") {
+			if got := lipgloss.Width(line); got > width {
+				t.Errorf("width %d: line %d width = %d", width, index, got)
+			}
+		}
 	}
 }
 

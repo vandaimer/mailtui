@@ -909,10 +909,10 @@ func paneBox(title, meta string, lines []string, width, height int, focused bool
 		borderColor = accent
 	}
 	return lipgloss.NewStyle().
-		Width(innerWidth).
-		Height(innerHeight).
-		MaxWidth(innerWidth).
-		MaxHeight(innerHeight).
+		Width(width).
+		Height(height).
+		MaxWidth(width).
+		MaxHeight(height).
 		Foreground(textColor).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
