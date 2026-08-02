@@ -87,6 +87,11 @@ type attachmentOpened struct {
 	path string
 	err  error
 }
+type folderReadDue struct {
+	path    string
+	refresh bool
+}
+type messageReadDue struct{ summary message.Message }
 type spinnerTick struct{}
 
 func (m Model) Init() tea.Cmd {
@@ -100,6 +105,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.bodyRenderCache = make(map[bodyRenderKey][]string)
 		}
 		m.width, m.height = value.Width, value.Height
+	case folderReadDue:
+		if value.path != m.selectedFolderPath() || (!value.refresh && m.selectedFolderLoaded()) || m.loadingFolder == value.path {
+			return m, nil
+		}
+		m.loadingFolder = value.path
+		return m, tea.Batch(beginFolderReadCmd(m.reader(), value.path, value.refresh), spinnerCmd())
 	case readsession.FolderRequest:
 		if value.Path != m.selectedFolderPath() {
 			if value.Refresh && m.refreshingFolder == value.Path {
@@ -156,6 +167,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if path == m.selectedFolderPath() {
 			return m, m.queueSelectedMessage(0)
 		}
+	case messageReadDue:
+		selected := m.selectedMessage()
+		if selected == nil || selected.Path != value.summary.Path || !selected.NeedsHydration() || m.loadingMessage == value.summary.Path {
+			return m, nil
+		}
+		m.loadingMessage = value.summary.Path
+		return m, tea.Batch(beginMessageReadCmd(m.reader(), value.summary), spinnerCmd())
 	case attachmentOpened:
 		m.openingAttachment = false
 		if value.err != nil {
@@ -165,7 +183,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case readsession.MessageRequest:
 		selected := m.selectedMessage()
-		if selected == nil || selected.Path != value.Path || selected.Loaded || selected.Err != nil || m.loadingMessage == value.Path {
+		if selected == nil || selected.Path != value.Path || !selected.NeedsHydration() || m.loadingMessage == value.Path {
 			return m, nil
 		}
 		m.loadingMessage = value.Path
@@ -260,7 +278,7 @@ func (m Model) updateNavigation(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "o":
 		selected := m.selectedMessage()
-		if selected != nil && selected.Loaded && len(selected.Attachments) > 0 {
+		if selected != nil && selected.LoadState() == message.LoadContentReady && len(selected.Attachments) > 0 {
 			m.attachmentPicker = true
 			m.attachmentIndex = 0
 			m.focus = readerPane
@@ -269,7 +287,7 @@ func (m Model) updateNavigation(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "v":
 		selected := m.selectedMessage()
-		if selected == nil || !selected.Loaded || strings.TrimSpace(selected.RichBody) == "" {
+		if selected == nil || selected.LoadState() != message.LoadContentReady || strings.TrimSpace(selected.RichBody) == "" {
 			m.status = "This message has no rich HTML view"
 			break
 		}
@@ -294,7 +312,7 @@ func (m Model) updateNavigation(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.status = "Refreshing the selected folder"
 		m.messageIndex = 0
 		m.readerScroll = 0
-		cmd = refreshFolderCmd(m.reader(), path)
+		cmd = refreshFolderCmd(path)
 	case "tab":
 		m.focus = (m.focus + 1) % 3
 		cmd = m.ensureFocusedData()
@@ -410,22 +428,32 @@ func (m Model) queueSelectedFolder(delay time.Duration) tea.Cmd {
 	if path == "" || m.selectedFolderLoaded() {
 		return nil
 	}
-	reader := m.reader()
-	return tea.Tick(delay, func(time.Time) tea.Msg { return reader.RequestFolder(path, false) })
+	return tea.Tick(delay, func(time.Time) tea.Msg { return folderReadDue{path: path} })
 }
 
-func refreshFolderCmd(reader readsession.Reader, path string) tea.Cmd {
-	return func() tea.Msg { return reader.RequestFolder(path, true) }
+func refreshFolderCmd(path string) tea.Cmd {
+	return func() tea.Msg { return folderReadDue{path: path, refresh: true} }
 }
 
 func (m Model) queueSelectedMessage(delay time.Duration) tea.Cmd {
 	selected := m.selectedMessage()
-	if selected == nil || selected.Path == "" || selected.Loaded || selected.Err != nil {
+	if selected == nil || !selected.NeedsHydration() {
 		return nil
 	}
-	path := selected.Path
-	reader := m.reader()
-	return tea.Tick(delay, func(time.Time) tea.Msg { return reader.RequestMessage(path) })
+	summary := *selected
+	return tea.Tick(delay, func(time.Time) tea.Msg { return messageReadDue{summary: summary} })
+}
+
+func beginFolderReadCmd(reader readsession.Reader, path string, refresh bool) tea.Cmd {
+	return func() tea.Msg {
+		return reader.ReadFolder(reader.RequestFolder(path, refresh))
+	}
+}
+
+func beginMessageReadCmd(reader readsession.Reader, summary message.Message) tea.Cmd {
+	return func() tea.Msg {
+		return reader.ReadMessage(reader.RequestMessage(summary))
+	}
 }
 
 func readFolderCmd(reader readsession.Reader, request readsession.FolderRequest) tea.Cmd {
@@ -488,13 +516,9 @@ func (m *Model) storeMessageResult(result readsession.MessageUpdate) {
 			if m.folders[folderIndex].Messages[messageIndex].Path != result.Request.Path {
 				continue
 			}
-			if result.Err != nil {
-				m.folders[folderIndex].Messages[messageIndex].Err = result.Err
-				m.folders[folderIndex].Messages[messageIndex].Loaded = true
-				m.folders[folderIndex].Messages[messageIndex].Body = "[this message could not be loaded]"
+			m.folders[folderIndex].Messages[messageIndex] = result.Message
+			if result.Message.LoadState() == message.LoadContentUnavailable {
 				m.status = "Could not load a message"
-			} else {
-				m.folders[folderIndex].Messages[messageIndex] = result.Message
 			}
 			break
 		}
@@ -680,8 +704,13 @@ func (m Model) messagesPane(geometry paneGeometry) string {
 			first := fitSides(truncate(displaySender(item.From), max(4, available-10)), displayDate(item.Date), available)
 			second := truncate(empty(item.Subject, "(no subject)"), available)
 			preview := snippet(item.Body)
-			if !item.Loaded {
+			switch item.LoadState() {
+			case message.LoadHeaderOnly:
 				preview = "Select to load the preview"
+			case message.LoadHeaderInvalid:
+				preview = "Invalid message"
+			case message.LoadContentUnavailable:
+				preview = "Message content unavailable"
 			}
 			third := truncate(preview, available)
 			if position == selected {
@@ -718,11 +747,19 @@ func (m Model) readerPane(geometry paneGeometry) string {
 		lines := []string{"", accentStyle.Render("No message selected"), mutedStyle.Render("Choose a message or adjust your search.")}
 		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
 	}
-	if item.Err != nil && !item.Loaded {
-		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Invalid message"), mutedStyle.Render(truncate(item.Err.Error(), available))}
+	if item.LoadState() == message.LoadHeaderInvalid {
+		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Invalid message"), mutedStyle.Render(truncate(item.LoadError().Error(), available))}
 		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
 	}
-	if !item.Loaded {
+	if item.LoadState() == message.LoadContentUnavailable {
+		lines := []string{
+			"",
+			lipgloss.NewStyle().Foreground(warning).Render("Could not load message content"),
+			mutedStyle.Render(truncate(item.LoadError().Error(), available)),
+		}
+		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
+	}
+	if item.LoadState() == message.LoadHeaderOnly {
 		lines := []string{
 			titleStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)),
 		}

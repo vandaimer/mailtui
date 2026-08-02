@@ -1,9 +1,11 @@
 package readsession
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
@@ -60,7 +62,7 @@ func TestFolderReadEmitsSortedProgressAndPersistsMetadata(t *testing.T) {
 	}
 }
 
-func TestNewerFolderRequestMakesOlderGenerationStaleBeforeIO(t *testing.T) {
+func TestSupersededFolderRequestIsStaleBeforeIO(t *testing.T) {
 	listCalls := 0
 	session := newSession(dependencies{
 		list: func(string) ([]string, string, error) {
@@ -72,7 +74,9 @@ func TestNewerFolderRequestMakesOlderGenerationStaleBeforeIO(t *testing.T) {
 		metadata: metadata.NewAt(filepath.Join(t.TempDir(), "cache")),
 	})
 	older := session.RequestFolder("/mail/INBOX", false)
-	_ = session.RequestFolder("/mail/INBOX", true)
+	session.mu.Lock()
+	session.latestFolders[older.Path] = older.ID + 1
+	session.mu.Unlock()
 
 	update := session.ReadFolder(older)
 	if !update.Stale || !update.Done || listCalls != 0 {
@@ -80,14 +84,139 @@ func TestNewerFolderRequestMakesOlderGenerationStaleBeforeIO(t *testing.T) {
 	}
 }
 
+func TestDuplicateFolderRequestKeepsAcceptedGenerationCurrent(t *testing.T) {
+	listCalls := 0
+	session := newSession(dependencies{
+		list: func(string) ([]string, string, error) {
+			listCalls++
+			return nil, "fingerprint", nil
+		},
+		scan: func([]string, int) <-chan maildir.HeaderBatch {
+			batches := make(chan maildir.HeaderBatch, 1)
+			batches <- maildir.HeaderBatch{Done: true}
+			close(batches)
+			return batches
+		},
+		hydrate:  message.ParseFile,
+		metadata: metadata.NewAt(filepath.Join(t.TempDir(), "cache")),
+	})
+
+	accepted := session.RequestFolder("/mail/INBOX", false)
+	duplicate := session.RequestFolder("/mail/INBOX", true)
+	if duplicate != accepted {
+		t.Fatalf("duplicate allocated generation %d; accepted generation is %d", duplicate.ID, accepted.ID)
+	}
+	if started := session.ReadFolder(accepted); started.Stale || !started.Started {
+		t.Fatalf("accepted folder read was invalidated: %#v", started)
+	}
+	completed := session.ReadFolder(accepted)
+	if completed.Stale || !completed.Done || listCalls != 1 {
+		t.Fatalf("accepted folder read did not complete: %#v, list calls=%d", completed, listCalls)
+	}
+	if next := session.RequestFolder("/mail/INBOX", true); next.ID == accepted.ID || !next.Refresh {
+		t.Fatalf("completed request remained pending: %#v", next)
+	}
+}
+
+func TestStaleStartedFolderReadDrainsScannerExactlyOnce(t *testing.T) {
+	batches := make(chan maildir.HeaderBatch)
+	producerReleased := make(chan struct{})
+	session := newSession(dependencies{
+		list: func(string) ([]string, string, error) { return nil, "fingerprint", nil },
+		scan: func([]string, int) <-chan maildir.HeaderBatch {
+			go func() {
+				batches <- maildir.HeaderBatch{Done: true}
+				close(batches)
+				close(producerReleased)
+			}()
+			return batches
+		},
+		hydrate:  message.ParseFile,
+		metadata: metadata.NewAt(filepath.Join(t.TempDir(), "cache")),
+	})
+	request := session.RequestFolder("/mail/INBOX", false)
+	if started := session.ReadFolder(request); !started.Started {
+		t.Fatalf("folder read did not start: %#v", started)
+	}
+
+	// Simulate a superseding generation from a non-UI caller. Normal duplicate
+	// requests are idempotent, but stale work must still release its producer.
+	session.mu.Lock()
+	session.latestFolders[request.Path] = request.ID + 1
+	session.mu.Unlock()
+	if stale := session.ReadFolder(request); !stale.Stale {
+		t.Fatalf("superseded folder read was not stale: %#v", stale)
+	}
+	select {
+	case <-producerReleased:
+	case <-time.After(time.Second):
+		t.Fatal("stale folder scan producer remained blocked")
+	}
+}
+
 func TestMessageReadHydratesOnlyTheRequestedFile(t *testing.T) {
 	folder, messagePath := syntheticMaildir(t, "Hydrated")
 	_ = folder
 	session := NewAt(filepath.Join(t.TempDir(), "cache"))
-	request := session.RequestMessage(messagePath)
+	request := session.RequestMessage(message.Message{Path: messagePath, From: "Cached sender", Subject: "Hydrated"})
 	update := session.ReadMessage(request)
-	if update.Err != nil || update.Stale || !update.Message.Loaded || update.Message.Subject != "Hydrated" || update.Message.Body != "Body" {
+	if update.Stale || update.Message.LoadState() != message.LoadContentReady || update.Message.LoadError() != nil || update.Message.Subject != "Hydrated" || update.Message.Body != "Body" {
 		t.Fatalf("message update = %#v", update)
+	}
+}
+
+func TestMessageReadFailurePreservesSummaryAsOneTerminalResult(t *testing.T) {
+	failure := errors.New("read failed")
+	session := newSession(dependencies{
+		list: maildir.ListMessagePaths,
+		scan: maildir.ScanHeaderBatches,
+		hydrate: func(string) (message.Message, error) {
+			return message.Message{Body: "partial content"}, failure
+		},
+		metadata: metadata.NewAt(filepath.Join(t.TempDir(), "cache")),
+	})
+	summary := message.Message{Path: "/mail/cur/1", From: "Alice", Subject: "Preserved"}
+	request := session.RequestMessage(summary)
+
+	update := session.ReadMessage(request)
+	if update.Stale || update.Message.Path != summary.Path || update.Message.From != summary.From || update.Message.Subject != summary.Subject {
+		t.Fatalf("summary metadata was not preserved: %#v", update)
+	}
+	if update.Message.LoadState() != message.LoadContentUnavailable || update.Message.LoadError() != failure || update.Message.Body != "" || update.Message.NeedsHydration() {
+		t.Fatalf("failure was not one terminal message: %#v", update.Message)
+	}
+}
+
+func TestDuplicateMessageRequestKeepsAcceptedHydrationCurrent(t *testing.T) {
+	hydrationStarted := make(chan struct{})
+	releaseHydration := make(chan struct{})
+	session := newSession(dependencies{
+		list: maildir.ListMessagePaths,
+		scan: maildir.ScanHeaderBatches,
+		hydrate: func(path string) (message.Message, error) {
+			close(hydrationStarted)
+			<-releaseHydration
+			return (message.Message{Path: path, Body: "Body"}).MarkContentReady(), nil
+		},
+		metadata: metadata.NewAt(filepath.Join(t.TempDir(), "cache")),
+	})
+	summary := message.Message{Path: "/mail/cur/1", Subject: "Accepted"}
+	accepted := session.RequestMessage(summary)
+	updates := make(chan MessageUpdate, 1)
+	go func() { updates <- session.ReadMessage(accepted) }()
+	<-hydrationStarted
+
+	duplicate := session.RequestMessage(message.Message{Path: summary.Path, Subject: "Duplicate"})
+	if duplicate.ID != accepted.ID || duplicate.Summary.Subject != summary.Subject {
+		t.Fatalf("duplicate superseded accepted request: %#v", duplicate)
+	}
+	close(releaseHydration)
+	update := <-updates
+	if update.Stale || update.Message.LoadState() != message.LoadContentReady {
+		t.Fatalf("accepted hydration was invalidated: %#v", update)
+	}
+	if next := session.RequestMessage(summary); next.ID == accepted.ID {
+		t.Fatalf("completed hydration remained pending: %#v", next)
 	}
 }
 
@@ -102,8 +231,8 @@ func TestNewerMessageRequestDiscardsOlderHydration(t *testing.T) {
 		},
 		metadata: metadata.NewAt(filepath.Join(t.TempDir(), "cache")),
 	})
-	older := session.RequestMessage("/mail/cur/older")
-	_ = session.RequestMessage("/mail/cur/newer")
+	older := session.RequestMessage(message.Message{Path: "/mail/cur/older"})
+	_ = session.RequestMessage(message.Message{Path: "/mail/cur/newer"})
 
 	update := session.ReadMessage(older)
 	if !update.Stale || hydrateCalls != 0 {

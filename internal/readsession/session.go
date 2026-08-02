@@ -40,15 +40,15 @@ type FolderUpdate struct {
 }
 
 type MessageRequest struct {
-	ID   RequestID
-	Path string
+	ID      RequestID
+	Path    string
+	Summary message.Message
 }
 
 type MessageUpdate struct {
 	Request MessageRequest
 	Message message.Message
 	Stale   bool
-	Err     error
 }
 
 // Reader is the narrow seam used by the UI. Request methods only allocate
@@ -57,7 +57,7 @@ type MessageUpdate struct {
 type Reader interface {
 	RequestFolder(path string, refresh bool) FolderRequest
 	ReadFolder(FolderRequest) FolderUpdate
-	RequestMessage(path string) MessageRequest
+	RequestMessage(summary message.Message) MessageRequest
 	ReadMessage(MessageRequest) MessageUpdate
 }
 
@@ -77,11 +77,13 @@ type dependencies struct {
 type Session struct {
 	mu sync.Mutex
 
-	nextID        RequestID
-	folders       map[RequestID]*folderRead
-	latestFolders map[string]RequestID
-	latestMessage RequestID
-	deps          dependencies
+	nextID         RequestID
+	folders        map[RequestID]*folderRead
+	latestFolders  map[string]RequestID
+	pendingFolders map[string]FolderRequest
+	latestMessage  RequestID
+	pendingMessage *MessageRequest
+	deps           dependencies
 }
 
 type folderRead struct {
@@ -93,6 +95,7 @@ type folderRead struct {
 	batches       <-chan maildir.HeaderBatch
 	messages      []message.Message
 	hadReadErrors bool
+	draining      bool
 }
 
 func New(root string) *Session {
@@ -117,9 +120,10 @@ func NewAt(cacheDir string) *Session {
 
 func newSession(deps dependencies) *Session {
 	return &Session{
-		folders:       make(map[RequestID]*folderRead),
-		latestFolders: make(map[string]RequestID),
-		deps:          deps,
+		folders:        make(map[RequestID]*folderRead),
+		latestFolders:  make(map[string]RequestID),
+		pendingFolders: make(map[string]FolderRequest),
+		deps:           deps,
 	}
 }
 
@@ -127,8 +131,12 @@ func (session *Session) RequestFolder(path string, refresh bool) FolderRequest {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
+	if request, found := session.pendingFolders[path]; found {
+		return request
+	}
 	request := FolderRequest{ID: session.allocateID(), Path: path, Refresh: refresh}
 	session.latestFolders[path] = request.ID
+	session.pendingFolders[path] = request
 	return request
 }
 
@@ -137,7 +145,13 @@ func (session *Session) ReadFolder(request FolderRequest) FolderUpdate {
 	read, found := session.folders[request.ID]
 	if session.latestFolders[request.Path] != request.ID {
 		delete(session.folders, request.ID)
+		if pending, pendingFound := session.pendingFolders[request.Path]; pendingFound && pending.ID == request.ID {
+			delete(session.pendingFolders, request.Path)
+		}
 		session.mu.Unlock()
+		if found {
+			read.drainBatches()
+		}
 		return FolderUpdate{Request: request, Done: true, Stale: true}
 	}
 	if !found {
@@ -146,6 +160,8 @@ func (session *Session) ReadFolder(request FolderRequest) FolderUpdate {
 	} else if read.request != request {
 		delete(session.folders, request.ID)
 		session.mu.Unlock()
+		read.drainBatches()
+		session.forgetFolder(read.request)
 		return FolderUpdate{Request: request, Done: true, Stale: true}
 	}
 	session.mu.Unlock()
@@ -153,34 +169,35 @@ func (session *Session) ReadFolder(request FolderRequest) FolderUpdate {
 	read.mu.Lock()
 	defer read.mu.Unlock()
 	if !session.folderIsCurrent(request) {
-		session.forgetFolder(request.ID)
+		read.startDrainLocked()
+		session.forgetFolder(request)
 		return FolderUpdate{Request: request, Done: true, Stale: true}
 	}
 	if read.done {
-		session.forgetFolder(request.ID)
+		session.forgetFolder(request)
 		return FolderUpdate{Request: request, Done: true, Messages: cloneMessages(read.messages), HadReadErrors: read.hadReadErrors}
 	}
 	if !read.started {
 		paths, fingerprint, err := session.deps.list(request.Path)
 		if !session.folderIsCurrent(request) {
-			session.forgetFolder(request.ID)
+			session.forgetFolder(request)
 			return FolderUpdate{Request: request, Done: true, Stale: true}
 		}
 		if err != nil {
 			read.done = true
-			session.forgetFolder(request.ID)
+			session.forgetFolder(request)
 			return FolderUpdate{Request: request, Done: true, Fatal: true, Err: err}
 		}
 		if !request.Refresh {
 			if messages, found := session.deps.metadata.Load(request.Path, fingerprint); found {
 				if !session.folderIsCurrent(request) {
-					session.forgetFolder(request.ID)
+					session.forgetFolder(request)
 					return FolderUpdate{Request: request, Done: true, Stale: true}
 				}
 				maildir.SortMessages(messages)
 				read.messages = messages
 				read.done = true
-				session.forgetFolder(request.ID)
+				session.forgetFolder(request)
 				return FolderUpdate{Request: request, Messages: cloneMessages(messages), Done: true}
 			}
 		}
@@ -195,7 +212,8 @@ func (session *Session) ReadFolder(request FolderRequest) FolderUpdate {
 		batch = maildir.HeaderBatch{Done: true}
 	}
 	if !session.folderIsCurrent(request) {
-		session.forgetFolder(request.ID)
+		read.startDrainLocked()
+		session.forgetFolder(request)
 		return FolderUpdate{Request: request, Done: true, Stale: true}
 	}
 	read.messages = append(read.messages, batch.Messages...)
@@ -216,17 +234,21 @@ func (session *Session) ReadFolder(request FolderRequest) FolderUpdate {
 		if !session.folderIsCurrent(request) {
 			update.Stale = true
 		}
-		session.forgetFolder(request.ID)
+		session.forgetFolder(request)
 	}
 	return update
 }
 
-func (session *Session) RequestMessage(path string) MessageRequest {
+func (session *Session) RequestMessage(summary message.Message) MessageRequest {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	request := MessageRequest{ID: session.allocateID(), Path: path}
+	if session.pendingMessage != nil && session.pendingMessage.Path == summary.Path {
+		return *session.pendingMessage
+	}
+	request := MessageRequest{ID: session.allocateID(), Path: summary.Path, Summary: summary}
 	session.latestMessage = request.ID
+	session.pendingMessage = &request
 	return request
 }
 
@@ -239,11 +261,17 @@ func (session *Session) ReadMessage(request MessageRequest) MessageUpdate {
 	session.mu.Unlock()
 
 	parsed, err := session.deps.hydrate(request.Path)
+	if err != nil {
+		parsed = request.Summary.MarkContentUnavailable(err)
+	}
 
 	session.mu.Lock()
 	stale := session.latestMessage != request.ID
+	if session.pendingMessage != nil && session.pendingMessage.ID == request.ID {
+		session.pendingMessage = nil
+	}
 	session.mu.Unlock()
-	return MessageUpdate{Request: request, Message: parsed, Stale: stale, Err: err}
+	return MessageUpdate{Request: request, Message: parsed, Stale: stale}
 }
 
 func (session *Session) allocateID() RequestID {
@@ -257,10 +285,30 @@ func (session *Session) folderIsCurrent(request FolderRequest) bool {
 	return session.latestFolders[request.Path] == request.ID
 }
 
-func (session *Session) forgetFolder(id RequestID) {
+func (session *Session) forgetFolder(request FolderRequest) {
 	session.mu.Lock()
-	delete(session.folders, id)
+	delete(session.folders, request.ID)
+	if pending, found := session.pendingFolders[request.Path]; found && pending.ID == request.ID {
+		delete(session.pendingFolders, request.Path)
+	}
 	session.mu.Unlock()
+}
+
+func (read *folderRead) drainBatches() {
+	read.mu.Lock()
+	defer read.mu.Unlock()
+	read.startDrainLocked()
+}
+
+func (read *folderRead) startDrainLocked() {
+	if read.draining || read.batches == nil {
+		return
+	}
+	read.draining = true
+	go func(batches <-chan maildir.HeaderBatch) {
+		for range batches {
+		}
+	}(read.batches)
 }
 
 func cloneMessages(messages []message.Message) []message.Message {

@@ -3,6 +3,7 @@ package message
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -263,8 +264,39 @@ func TestParseHeaderFileDoesNotHydrateBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Subject != "Lightweight" || parsed.Body != "" || parsed.Loaded {
+	if parsed.Subject != "Lightweight" || parsed.Body != "" || parsed.LoadState() != LoadHeaderOnly || !parsed.NeedsHydration() {
 		t.Fatalf("unexpected header result: %#v", parsed)
+	}
+}
+
+func TestLoadStateTransitionsAreTerminalAndKeepFailuresOutOfBody(t *testing.T) {
+	failure := errors.New("unreadable")
+	summary := Message{Path: "/mail/cur/1", From: "Alice", Subject: "Subject"}
+
+	invalid := summary.MarkHeaderInvalid(failure)
+	if invalid.LoadState() != LoadHeaderInvalid || invalid.LoadError() != failure || invalid.NeedsHydration() {
+		t.Fatalf("invalid header state = %#v", invalid)
+	}
+	unavailable := summary.MarkContentUnavailable(failure)
+	if unavailable.LoadState() != LoadContentUnavailable || unavailable.LoadError() != failure || unavailable.Body != "" || unavailable.NeedsHydration() {
+		t.Fatalf("unavailable content state = %#v", unavailable)
+	}
+	ready := summary.MarkContentReady()
+	if ready.LoadState() != LoadContentReady || ready.LoadError() != nil || ready.NeedsHydration() {
+		t.Fatalf("ready content state = %#v", ready)
+	}
+}
+
+func TestParseFileDoesNotMarkPartialMIMETraversalReady(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "malformed-multipart")
+	writeMessage(t, path, "Subject: Broken\r\nContent-Type: multipart/mixed\r\n\r\nBody")
+
+	parsed, err := ParseFile(path)
+	if err == nil {
+		t.Fatal("malformed multipart unexpectedly parsed")
+	}
+	if parsed.Subject != "Broken" || parsed.LoadState() != LoadHeaderOnly || parsed.Body != "" || len(parsed.Attachments) != 0 {
+		t.Fatalf("partial parse escaped as content: %#v", parsed)
 	}
 }
 

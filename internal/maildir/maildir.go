@@ -172,7 +172,7 @@ func scanHeaderBatches(paths []string, batchSize int, output chan<- HeaderBatch)
 			for path := range jobs {
 				parsed, parseErr := message.ParseHeaderFile(path)
 				if parseErr != nil {
-					parsed = message.Message{Path: path, Subject: "[invalid message]", Err: parseErr}
+					parsed = (message.Message{Path: path, Subject: "[invalid message]"}).MarkHeaderInvalid(parseErr)
 				}
 				results <- result{message: parsed, err: parseErr}
 			}

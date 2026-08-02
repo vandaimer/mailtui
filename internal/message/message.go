@@ -51,6 +51,18 @@ type ImagePreview struct {
 	Pixels    []color.NRGBA
 }
 
+// LoadState describes the only valid stages of a message during a read
+// session. The zero value is a successfully parsed header whose content has
+// not been read yet.
+type LoadState uint8
+
+const (
+	LoadHeaderOnly LoadState = iota
+	LoadHeaderInvalid
+	LoadContentReady
+	LoadContentUnavailable
+)
+
 type Message struct {
 	Path        string
 	From        string
@@ -65,8 +77,61 @@ type Message struct {
 	RichBody    string
 	Attachments []Attachment
 	Images      []ImagePreview
-	Err         error
-	Loaded      bool
+	loadState   LoadState
+	loadErr     error
+}
+
+func (m Message) LoadState() LoadState { return m.loadState }
+
+func (m Message) LoadError() error { return m.loadErr }
+
+func (m Message) NeedsHydration() bool {
+	return m.Path != "" && m.loadState == LoadHeaderOnly
+}
+
+// MarkHeaderInvalid records a header parse failure. It is a terminal state.
+func (m Message) MarkHeaderInvalid(err error) Message {
+	m.Body = ""
+	m.RichBody = ""
+	m.Attachments = nil
+	m.Images = nil
+	return m.transitionTo(LoadHeaderInvalid, err)
+}
+
+// MarkContentReady records a successful full-message hydration.
+func (m Message) MarkContentReady() Message {
+	return m.transitionTo(LoadContentReady, nil)
+}
+
+// MarkContentUnavailable preserves header metadata while recording a terminal
+// hydration failure. No display fallback is stored as message content.
+func (m Message) MarkContentUnavailable(err error) Message {
+	m.Body = ""
+	m.RichBody = ""
+	m.Attachments = nil
+	m.Images = nil
+	return m.transitionTo(LoadContentUnavailable, err)
+}
+
+func (m Message) transitionTo(next LoadState, err error) Message {
+	if m.loadState != LoadHeaderOnly {
+		panic("message load state is already terminal")
+	}
+	switch next {
+	case LoadContentReady:
+		if err != nil {
+			panic("ready message cannot contain a load error")
+		}
+	case LoadHeaderInvalid, LoadContentUnavailable:
+		if err == nil {
+			panic("message failure state requires an error")
+		}
+	default:
+		panic("invalid terminal message load state")
+	}
+	m.loadState = next
+	m.loadErr = err
+	return m
 }
 
 // ParseHeaderFile reads only the RFC 822 headers. It deliberately leaves the
@@ -92,13 +157,12 @@ func ParseFile(path string) (Message, error) {
 	}
 
 	m := fromHeaders(path, raw.Header)
-	m.Loaded = true
 	contents, err := traverseMIME(root, true, -1)
-	m.Attachments = contents.attachments
-	m.Images = contents.texts.images
 	if err != nil {
 		return m, err
 	}
+	m.Attachments = contents.attachments
+	m.Images = contents.texts.images
 	if contents.texts.html != "" {
 		if richBody, richErr := htmlToMarkdown(contents.texts.html); richErr == nil {
 			m.RichBody = strings.TrimSpace(richBody)
@@ -112,7 +176,7 @@ func ParseFile(path string) (Message, error) {
 	if strings.TrimSpace(m.Body) == "" {
 		m.Body = "[no text body]"
 	}
-	return m, nil
+	return m.MarkContentReady(), nil
 }
 
 // ExtractAttachment returns one decoded MIME attachment by the same order used

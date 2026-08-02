@@ -206,25 +206,73 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header ready"}
 	updated, _ = m.Update(readsession.FolderUpdate{Request: folderRequest, Messages: []message.Message{summary}, Done: true})
 	m = updated.(Model)
-	if m.loadingFolder != "" || len(m.folders[0].Messages) != 1 || m.folders[0].Messages[0].Loaded {
+	if m.loadingFolder != "" || len(m.folders[0].Messages) != 1 || m.folders[0].Messages[0].LoadState() != message.LoadHeaderOnly {
 		t.Fatalf("unexpected header phase: %#v", m)
 	}
 	if !strings.Contains(m.View().Content, "Loading content") {
 		t.Fatal("reader does not expose the deferred body load")
 	}
 
-	messageRequest := reads.RequestMessage(summary.Path)
+	messageRequest := reads.RequestMessage(summary)
 	updated, cmd = m.Update(messageRequest)
 	m = updated.(Model)
 	if cmd == nil || m.loadingMessage != summary.Path {
 		t.Fatalf("message load did not start asynchronously: %#v", m)
 	}
 	full := summary
-	full.Body, full.Loaded = "Content arrived", true
+	full.Body = "Content arrived"
+	full = full.MarkContentReady()
 	updated, _ = m.Update(readsession.MessageUpdate{Request: messageRequest, Message: full})
 	m = updated.(Model)
 	if m.loadingMessage != "" || !strings.Contains(m.View().Content, "Content arrived") {
 		t.Fatalf("message was not hydrated: %#v", m)
+	}
+}
+
+func TestHydrationFailurePreservesHeadersAndDoesNotBecomeBodyContent(t *testing.T) {
+	reads := &stubReader{}
+	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header survives"}
+	request := reads.RequestMessage(summary)
+	m := Model{
+		folders:        []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{summary}}},
+		loadingMessage: summary.Path,
+		width:          130,
+		height:         32,
+		reads:          reads,
+	}
+	failure := errors.New("permission denied")
+
+	updated, _ := m.Update(readsession.MessageUpdate{Request: request, Message: summary.MarkContentUnavailable(failure)})
+	m = updated.(Model)
+	stored := m.folders[0].Messages[0]
+	if stored.Subject != summary.Subject || stored.From != summary.From || stored.LoadState() != message.LoadContentUnavailable || stored.LoadError() != failure || stored.Body != "" {
+		t.Fatalf("stored failure = %#v", stored)
+	}
+	if m.loadingMessage != "" || m.queueSelectedMessage(0) != nil {
+		t.Fatalf("terminal failure was left loading or retryable: %#v", m)
+	}
+	view := m.View().Content
+	if !strings.Contains(view, "Could not load message content") || !strings.Contains(view, "permission denied") {
+		t.Fatalf("failure state was not rendered explicitly:\n%s", view)
+	}
+}
+
+func TestInvalidHeaderIsTerminalAndRenderedSeparately(t *testing.T) {
+	failure := errors.New("malformed header")
+	invalid := (message.Message{Path: "/network/INBOX/cur/broken", Subject: "[invalid message]"}).MarkHeaderInvalid(failure)
+	m := Model{
+		folders: []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{invalid}}},
+		width:   130,
+		height:  32,
+		reads:   &stubReader{},
+	}
+
+	if m.queueSelectedMessage(0) != nil {
+		t.Fatal("invalid header was scheduled for hydration")
+	}
+	view := m.View().Content
+	if !strings.Contains(view, "Invalid message") || !strings.Contains(view, "malformed header") || strings.Contains(view, "Loading content") {
+		t.Fatalf("invalid header state was not distinct:\n%s", view)
 	}
 }
 
@@ -245,9 +293,44 @@ func TestRefreshKeyForcesSelectedFolderReload(t *testing.T) {
 	if cmd == nil || m.refreshingFolder != "/network/INBOX" || m.messageIndex != 0 {
 		t.Fatalf("refresh was not scheduled: %#v", m)
 	}
-	request, ok := cmd().(readsession.FolderRequest)
-	if !ok || request.Path != "/network/INBOX" || !request.Refresh {
-		t.Fatalf("unexpected refresh request: %#v", request)
+	due, ok := cmd().(folderReadDue)
+	if !ok || due.path != "/network/INBOX" || !due.refresh {
+		t.Fatalf("unexpected refresh schedule: %#v", due)
+	}
+}
+
+func TestDuplicateReadDueIsRejectedBeforeAllocatingNewGeneration(t *testing.T) {
+	reads := &stubReader{}
+	folderModel := Model{
+		folders: []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}},
+		reads:   reads,
+	}
+	due := folderReadDue{path: "/network/INBOX"}
+	updated, firstCmd := folderModel.Update(due)
+	folderModel = updated.(Model)
+	if firstCmd == nil || folderModel.loadingFolder != due.path || reads.next != 0 {
+		t.Fatalf("first folder schedule was not accepted before allocation: %#v", folderModel)
+	}
+	updated, duplicateCmd := folderModel.Update(due)
+	folderModel = updated.(Model)
+	if duplicateCmd != nil || reads.next != 0 {
+		t.Fatalf("duplicate folder schedule allocated a generation: cmd=%v next=%d", duplicateCmd != nil, reads.next)
+	}
+
+	summary := message.Message{Path: "/network/INBOX/cur/1", Subject: "Summary"}
+	messageModel := Model{
+		folders: []maildir.Folder{{Path: "/network/INBOX", Messages: []message.Message{summary}}},
+		reads:   reads,
+	}
+	messageDue := messageReadDue{summary: summary}
+	updated, firstCmd = messageModel.Update(messageDue)
+	messageModel = updated.(Model)
+	if firstCmd == nil || messageModel.loadingMessage != summary.Path || reads.next != 0 {
+		t.Fatalf("first message schedule was not accepted before allocation: %#v", messageModel)
+	}
+	updated, duplicateCmd = messageModel.Update(messageDue)
+	if duplicateCmd != nil || reads.next != 0 {
+		t.Fatalf("duplicate message schedule allocated a generation: cmd=%v next=%d", duplicateCmd != nil, reads.next)
 	}
 }
 
@@ -309,8 +392,8 @@ func testModel() Model {
 	folders := []maildir.Folder{{
 		Name: "INBOX",
 		Messages: []message.Message{
-			{From: "Alice <alice@example.com>", To: "me@example.com", Subject: "First message", Body: "Alice's message body", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local), Loaded: true},
-			{From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local), Loaded: true},
+			(message.Message{From: "Alice <alice@example.com>", To: "me@example.com", Subject: "First message", Body: "Alice's message body", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local)}).MarkContentReady(),
+			(message.Message{From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local)}).MarkContentReady(),
 		},
 	}}
 	return Model{root: "/backup/mail", folders: folders, width: 130, height: 32, reads: &stubReader{}}
@@ -327,9 +410,9 @@ func (reader *stubReader) ReadFolder(request readsession.FolderRequest) readsess
 	return readsession.FolderUpdate{Request: request, Done: true}
 }
 
-func (reader *stubReader) RequestMessage(path string) readsession.MessageRequest {
+func (reader *stubReader) RequestMessage(summary message.Message) readsession.MessageRequest {
 	reader.next++
-	return readsession.MessageRequest{ID: reader.next, Path: path}
+	return readsession.MessageRequest{ID: reader.next, Path: summary.Path, Summary: summary}
 }
 
 func (reader *stubReader) ReadMessage(request readsession.MessageRequest) readsession.MessageUpdate {
