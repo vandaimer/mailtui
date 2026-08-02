@@ -53,9 +53,10 @@ only after explicit `o`/Enter interaction, sanitized, written outside Maildir,
 and opened with the platform's default application.
 
 GitHub Actions run formatting, tests, vetting, and a static build on pushes and
-pull requests. Tags matching `v*` build checksummed Linux, macOS, and Windows
-archives and publish a GitHub release. `install.sh` installs a selected release
-on Linux or macOS and verifies its SHA-256 checksum before copying the binary.
+pull requests. Tags matching `v*`, or a manual Actions run with a semantic
+version input, build checksummed Linux, macOS, and Windows archives and publish
+a GitHub release. `install.sh` installs a selected release on Linux or macOS and
+verifies its SHA-256 checksum before copying the binary.
 
 ## User feedback and immediate product goal
 

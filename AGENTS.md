@@ -63,7 +63,8 @@ The code is split across `internal/maildir`, `internal/message`, and
 - safe on-demand attachment extraction outside Maildir and opening through
   the platform default application from the attachment picker;
 - release automation for Linux, macOS, and Windows, plus a checksum-verifying
-  installer for Linux and macOS.
+  installer for Linux and macOS. Releases can be started from a pushed semantic
+  version tag or manually through the GitHub Actions UI.
 
 Tests alongside each internal package cover Maildir discovery and ordering,
 MIME parsing, attachments, HTML fallback, Base64 bodies, search interaction,

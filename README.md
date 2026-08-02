@@ -75,9 +75,13 @@ in the default PDF viewer. Original Maildir files remain untouched.
 
 ## Releases
 
-Every pushed `vX.Y.Z` tag runs the release workflow, tests the project, builds
-static binaries for Linux, macOS, and Windows on amd64 and arm64, writes SHA-256
-checksums, and creates a GitHub release with generated notes.
+Run the release workflow manually from **Actions → Release → Run workflow** and
+enter a `vX.Y.Z` version. The workflow creates the tag and GitHub release from
+the selected branch. Pushing a `vX.Y.Z` tag remains supported as an alternative.
+
+Both paths test the project, build static binaries for Linux, macOS, and Windows
+on amd64 and arm64, write SHA-256 checksums, and create a GitHub release with
+generated notes.
 
 ```sh
 git tag v0.1.0

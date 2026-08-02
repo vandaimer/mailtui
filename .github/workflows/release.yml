@@ -1,9 +1,16 @@
 name: Release
+run-name: Release ${{ inputs.version || github.ref_name }}
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (for example, v0.1.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -22,25 +29,52 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Resolve release version
+        id: release
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$REQUESTED_VERSION"
+          else
+            version="$GITHUB_REF_NAME"
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $version" >&2
+            exit 2
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Test
         run: go test ./...
 
       - name: Build release assets
-        run: ./scripts/build-release.sh "$GITHUB_REF_NAME"
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: ./scripts/build-release.sh "$RELEASE_VERSION"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
+          extra_args=()
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            extra_args+=(--target "$GITHUB_SHA")
+          else
+            extra_args+=(--verify-tag)
+          fi
+          gh release create "$RELEASE_VERSION" dist/* \
+            "${extra_args[@]}" \
             --generate-notes \
-            --title "mailtui $GITHUB_REF_NAME"
+            --title "mailtui $RELEASE_VERSION"
 
       - name: Verify published installer
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           ./install.sh \
             --repo "$GITHUB_REPOSITORY" \
-            --version "$GITHUB_REF_NAME" \
+            --version "$RELEASE_VERSION" \
             --dir "$RUNNER_TEMP/bin"
-          test "$("$RUNNER_TEMP/bin/mailtui" --version)" = "mailtui $GITHUB_REF_NAME"
+          test "$("$RUNNER_TEMP/bin/mailtui" --version)" = "mailtui $RELEASE_VERSION"
