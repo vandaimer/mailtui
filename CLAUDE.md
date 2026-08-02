@@ -47,6 +47,10 @@ scans concurrently read headers only; full bodies and attachments are loaded
 only for the selected message. Both folder and message selection are debounced,
 and all I/O runs as Bubble Tea commands rather than inside the event loop. Do
 not reintroduce synchronous folder parsing or full-file reads for list rows.
+Header scans stream batches of 64 and persist header-only summaries under the
+user cache, keyed by a fingerprint of Maildir paths. Attachments are extracted
+only after explicit `o`/Enter interaction, sanitized, written outside Maildir,
+and opened with `xdg-open`.
 
 ## User feedback and immediate product goal
 

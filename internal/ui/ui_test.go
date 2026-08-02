@@ -144,6 +144,40 @@ func TestFolderNavigationIsDebounced(t *testing.T) {
 	}
 }
 
+func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
+	m := Model{
+		folders:       []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{}}},
+		loadingFolder: "/network/INBOX",
+	}
+	first := maildir.HeaderBatch{Messages: []message.Message{{Path: "/network/INBOX/cur/1", Subject: "First batch"}}}
+	updated, _ := m.Update(folderBatchReceived{path: "/network/INBOX", batch: first})
+	m = updated.(Model)
+	if len(m.folders[0].Messages) != 1 || m.loadingFolder == "" {
+		t.Fatalf("first batch was not progressive: %#v", m)
+	}
+	updated, _ = m.Update(folderBatchReceived{path: "/network/INBOX", batch: maildir.HeaderBatch{Done: true}})
+	m = updated.(Model)
+	if m.loadingFolder != "" {
+		t.Fatalf("completed batch kept loading state: %#v", m)
+	}
+}
+
+func TestAttachmentPickerIsDiscoverable(t *testing.T) {
+	m := testModel()
+	m.folders[0].Messages[0].Path = "/mail/cur/1"
+	m.folders[0].Messages[0].Attachments = []message.Attachment{{Name: "invoice.pdf", MediaType: "application/pdf", Size: 4096}}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	m = updated.(Model)
+	if !m.attachmentPicker || !strings.Contains(m.View(), "invoice.pdf") {
+		t.Fatalf("attachment picker did not open: %#v", m)
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if cmd == nil || m.attachmentPicker || !m.openingAttachment {
+		t.Fatalf("attachment open was not scheduled: %#v", m)
+	}
+}
+
 func testModel() Model {
 	folders := []maildir.Folder{{
 		Name: "INBOX",

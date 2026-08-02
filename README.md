@@ -29,6 +29,7 @@ Teclas:
 - `Enter`: confirmar a busca ou avançar para o próximo painel;
 - `Esc`: cancelar a busca, limpar o filtro ou voltar;
 - `PgUp/PgDn`: rolar o corpo da mensagem;
+- `o`: escolher e abrir um anexo com o aplicativo padrão;
 - `q`: sair.
 
 `INBOX` aparece primeiro, seguida pelas pastas Gmail/sistema e pelas labels do
@@ -45,3 +46,16 @@ mantém o resultado em memória. O corpo MIME completo — incluindo anexos — 
 lido para a mensagem selecionada. Pequenas pausas na seleção usam debounce para
 que atravessar rapidamente a lista de pastas ou mensagens não dispare leituras
 desnecessárias no ponto de montagem remoto.
+
+Na primeira leitura de uma pasta, os headers aparecem progressivamente em
+lotes. Ao terminar, o programa guarda somente esses metadados em
+`~/.cache/mailtui/metadata-v1/`. Nas execuções seguintes ele compara a lista de
+arquivos do Maildir e reutiliza o cache se ela não mudou. Nenhum índice ou cache
+é criado dentro do backup.
+
+## Anexos
+
+Com uma mensagem carregada, pressione `o`, escolha o anexo e confirme com
+`Enter`. O conteúdo é decodificado para `~/.cache/mailtui/attachments/` com
+permissões restritas e aberto via `xdg-open` — por exemplo, um PDF vai para o
+visualizador padrão do desktop. Os arquivos originais permanecem intactos.

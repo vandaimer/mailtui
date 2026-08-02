@@ -58,6 +58,10 @@ The code is split across `internal/maildir`, `internal/message`, and
 - keyboard navigation and `/` filtering over subject and address headers.
 - asynchronous, debounced network I/O: concurrent header-only folder scans and
   full MIME hydration only for the selected message.
+- progressive header batches and a fingerprinted metadata cache under the
+  user's cache directory for fast repeat visits;
+- safe on-demand attachment extraction outside Maildir and opening through
+  `xdg-open` from the attachment picker.
 
 Tests alongside each internal package cover Maildir discovery and ordering,
 MIME parsing, attachments, HTML fallback, Base64 bodies, search interaction,
@@ -72,10 +76,21 @@ The UI stores those summaries in memory. Message selection emits a separate
 debounced command and calls `message.ParseFile` only for that one file. Loaded
 messages remain hydrated in memory while the application runs.
 
+On cache miss, headers are delivered to the UI in batches of 64. At completion,
+summaries are written to the platform user cache directory. Cache validation
+hashes the sorted `cur/` and `new/` paths, so a normal Maildir filename change
+invalidates it without reading message contents. Cache files contain headers,
+not bodies or attachment payloads.
+
 Do not regress to `os.ReadFile` for every message in a folder. File managers
 appear fast because they list directory entries without parsing mail; this
 two-phase strategy keeps mail-specific metadata while avoiding full attachment
 downloads. A future persistent index must still live outside the Maildir.
+
+Attachment opening is explicitly user-triggered with `o`. The selected MIME
+part is decoded again, sanitized with `filepath.Base`, written with mode 0600
+under the user cache, and handed to `xdg-open`. Never materialize attachments
+under the Maildir or trust a MIME filename as a path.
 
 ## Current UX status
 

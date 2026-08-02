@@ -11,8 +11,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"mailtui/internal/attachment"
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
+	"mailtui/internal/metadata"
 )
 
 type pane int
@@ -61,10 +63,14 @@ type Model struct {
 	loadingFolder             string
 	loadingMessage            string
 	spinnerFrame              int
+	metadata                  *metadata.Store
+	attachmentPicker          bool
+	attachmentIndex           int
+	openingAttachment         bool
 }
 
 func New(root string, folders []maildir.Folder) Model {
-	return Model{root: root, folders: folders, focus: foldersPane}
+	return Model{root: root, folders: folders, focus: foldersPane, metadata: metadata.New(root)}
 }
 
 type folderLoadRequest struct{ path string }
@@ -72,6 +78,23 @@ type folderLoaded struct {
 	path     string
 	messages []message.Message
 	err      error
+}
+type folderScanStarted struct {
+	path        string
+	fingerprint string
+	batches     <-chan maildir.HeaderBatch
+	err         error
+}
+type folderBatchReceived struct {
+	path        string
+	fingerprint string
+	batches     <-chan maildir.HeaderBatch
+	batch       maildir.HeaderBatch
+}
+type metadataSaved struct{ err error }
+type attachmentOpened struct {
+	path string
+	err  error
 }
 type messageLoadRequest struct{ path string }
 type messageLoaded struct {
@@ -94,11 +117,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loadingFolder = value.path
-		return m, tea.Batch(scanFolderCmd(value.path), spinnerCmd())
+		return m, tea.Batch(startFolderScanCmd(value.path, m.metadata), spinnerCmd())
 	case folderLoaded:
 		m.storeFolderResult(value)
 		if value.path == m.selectedFolderPath() {
 			return m, m.queueSelectedMessage(0)
+		}
+	case folderScanStarted:
+		if value.err != nil {
+			m.storeFolderResult(folderLoaded{path: value.path, messages: []message.Message{}, err: value.err})
+			return m, nil
+		}
+		m.replaceFolderMessages(value.path, []message.Message{})
+		return m, nextFolderBatchCmd(value.path, value.fingerprint, value.batches)
+	case folderBatchReceived:
+		m.appendFolderBatch(value.path, value.batch)
+		if !value.batch.Done {
+			return m, nextFolderBatchCmd(value.path, value.fingerprint, value.batches)
+		}
+		if m.loadingFolder == value.path {
+			m.loadingFolder = ""
+		}
+		commands := []tea.Cmd{saveMetadataCmd(m.metadata, value.path, value.fingerprint, m.folderMessages(value.path))}
+		if value.path == m.selectedFolderPath() {
+			commands = append(commands, m.queueSelectedMessage(0))
+		}
+		return m, tea.Batch(commands...)
+	case metadataSaved:
+		if value.err != nil {
+			m.status = "Não foi possível atualizar o cache local"
+		}
+	case attachmentOpened:
+		m.openingAttachment = false
+		if value.err != nil {
+			m.status = "Não foi possível abrir o anexo: " + value.err.Error()
+		} else {
+			m.status = "Anexo aberto: " + filepath.Base(value.path)
 		}
 	case messageLoadRequest:
 		selected := m.selectedMessage()
@@ -111,14 +165,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.storeMessageResult(value)
 	case spinnerTick:
 		m.spinnerFrame++
-		if m.loadingFolder != "" || m.loadingMessage != "" {
+		if m.loadingFolder != "" || m.loadingMessage != "" || m.openingAttachment {
 			return m, spinnerCmd()
 		}
 	case tea.KeyMsg:
+		if m.attachmentPicker {
+			return m.updateAttachmentPicker(value)
+		}
 		if m.searching {
 			return m.updateSearch(value)
 		}
 		return m.updateNavigation(value)
+	}
+	return m, nil
+}
+
+func (m Model) updateAttachmentPicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	selected := m.selectedMessage()
+	if selected == nil || len(selected.Attachments) == 0 {
+		m.attachmentPicker = false
+		return m, nil
+	}
+	switch key.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "q", "o":
+		m.attachmentPicker = false
+	case "up", "k":
+		m.attachmentIndex = clamp(m.attachmentIndex-1, 0, len(selected.Attachments)-1)
+	case "down", "j":
+		m.attachmentIndex = clamp(m.attachmentIndex+1, 0, len(selected.Attachments)-1)
+	case "enter":
+		m.attachmentPicker = false
+		m.openingAttachment = true
+		return m, tea.Batch(openAttachmentCmd(selected.Path, m.attachmentIndex), spinnerCmd())
 	}
 	return m, nil
 }
@@ -165,6 +245,15 @@ func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.queryBeforeSearch = m.query
 		if m.focus == foldersPane {
 			m.focus = messagesPane
+		}
+	case "o":
+		selected := m.selectedMessage()
+		if selected != nil && selected.Loaded && len(selected.Attachments) > 0 {
+			m.attachmentPicker = true
+			m.attachmentIndex = 0
+			m.focus = readerPane
+		} else {
+			m.status = "A mensagem selecionada não possui anexos"
 		}
 	case "tab":
 		m.focus = (m.focus + 1) % 3
@@ -291,10 +380,37 @@ func (m Model) queueSelectedMessage(delay time.Duration) tea.Cmd {
 	return tea.Tick(delay, func(time.Time) tea.Msg { return messageLoadRequest{path: path} })
 }
 
-func scanFolderCmd(path string) tea.Cmd {
+func startFolderScanCmd(path string, store *metadata.Store) tea.Cmd {
 	return func() tea.Msg {
-		messages, err := maildir.ScanHeaders(path)
-		return folderLoaded{path: path, messages: messages, err: err}
+		paths, fingerprint, err := maildir.ListMessagePaths(path)
+		if err != nil {
+			return folderScanStarted{path: path, err: err}
+		}
+		if messages, found := store.Load(path, fingerprint); found {
+			maildir.SortMessages(messages)
+			return folderLoaded{path: path, messages: messages}
+		}
+		return folderScanStarted{
+			path: path, fingerprint: fingerprint,
+			batches: maildir.ScanHeaderBatches(paths, 64),
+		}
+	}
+}
+
+func nextFolderBatchCmd(path, fingerprint string, batches <-chan maildir.HeaderBatch) tea.Cmd {
+	return func() tea.Msg {
+		batch, ok := <-batches
+		if !ok {
+			batch = maildir.HeaderBatch{Done: true}
+		}
+		return folderBatchReceived{path: path, fingerprint: fingerprint, batches: batches, batch: batch}
+	}
+}
+
+func saveMetadataCmd(store *metadata.Store, path, fingerprint string, messages []message.Message) tea.Cmd {
+	snapshot := append([]message.Message(nil), messages...)
+	return func() tea.Msg {
+		return metadataSaved{err: store.Save(path, fingerprint, snapshot)}
 	}
 }
 
@@ -305,17 +421,22 @@ func loadMessageCmd(path string) tea.Cmd {
 	}
 }
 
+func openAttachmentCmd(messagePath string, index int) tea.Cmd {
+	return func() tea.Msg {
+		path, err := attachment.ExtractToCache(messagePath, index)
+		if err == nil {
+			err = attachment.OpenDefault(path)
+		}
+		return attachmentOpened{path: path, err: err}
+	}
+}
+
 func spinnerCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTick{} })
 }
 
 func (m *Model) storeFolderResult(result folderLoaded) {
-	for index := range m.folders {
-		if m.folders[index].Path == result.path {
-			m.folders[index].Messages = result.messages
-			break
-		}
-	}
+	m.replaceFolderMessages(result.path, result.messages)
 	if m.loadingFolder == result.path {
 		m.loadingFolder = ""
 	}
@@ -324,6 +445,38 @@ func (m *Model) storeFolderResult(result folderLoaded) {
 	} else if result.path == m.selectedFolderPath() {
 		m.status = ""
 	}
+}
+
+func (m *Model) replaceFolderMessages(path string, messages []message.Message) {
+	for index := range m.folders {
+		if m.folders[index].Path == path {
+			m.folders[index].Messages = messages
+			return
+		}
+	}
+}
+
+func (m *Model) appendFolderBatch(path string, batch maildir.HeaderBatch) {
+	for index := range m.folders {
+		if m.folders[index].Path != path {
+			continue
+		}
+		m.folders[index].Messages = append(m.folders[index].Messages, batch.Messages...)
+		maildir.SortMessages(m.folders[index].Messages)
+		break
+	}
+	if batch.Err != nil {
+		m.status = "Algumas mensagens não puderam ser lidas"
+	}
+}
+
+func (m Model) folderMessages(path string) []message.Message {
+	for index := range m.folders {
+		if m.folders[index].Path == path {
+			return m.folders[index].Messages
+		}
+	}
+	return nil
 }
 
 func (m *Model) storeMessageResult(result messageLoaded) {
@@ -420,17 +573,22 @@ func (m Model) headerView() string {
 }
 
 func (m Model) footerView() string {
+	if m.attachmentPicker {
+		return fitSides(accentStyle.Render("ANEXOS  ↑↓ selecionar  Enter abrir  Esc cancelar"), mutedStyle.Render("somente leitura"), m.width)
+	}
 	if m.searching {
 		count := len(m.filteredMessageIndexes())
 		left := accentStyle.Render(" / ") + lipgloss.NewStyle().Foreground(textColor).Render(m.query+"█")
 		right := mutedStyle.Render(fmt.Sprintf("%d resultado(s)  Enter aplicar  Esc cancelar", count))
 		return fitSides(left, right, m.width)
 	}
-	left := softStyle.Render("Tab/←→ foco  ↑↓ navegar  / buscar  Enter avançar  Esc voltar")
+	left := softStyle.Render("Tab/←→ foco  ↑↓ navegar  / buscar  o anexos  Esc voltar")
 	if m.loadingFolder != "" {
 		left = accentStyle.Render(m.spinner()+" Lendo headers…") + "  " + left
 	} else if m.loadingMessage != "" {
 		left = accentStyle.Render(m.spinner()+" Lendo mensagem…") + "  " + left
+	} else if m.openingAttachment {
+		left = accentStyle.Render(m.spinner()+" Abrindo anexo…") + "  " + left
 	}
 	if m.status != "" {
 		left = lipgloss.NewStyle().Foreground(warning).Render("⚠ "+m.status) + "  " + left
@@ -554,6 +712,10 @@ func (m Model) readerPane(width, height int) string {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Preparando pasta"), mutedStyle.Render("A interface continua disponível durante a leitura.")}
 		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
 	}
+	if m.loadingFolder != "" && m.loadingFolder == m.selectedFolderPath() {
+		lines := []string{"", accentStyle.Render(m.spinner() + " Recebendo mensagens em lotes"), mutedStyle.Render(fmt.Sprintf("%d headers disponíveis até agora…", m.folderMessageCount()))}
+		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+	}
 	item := m.selectedMessage()
 	contentHeight := paneContentHeight(height)
 	available := max(10, width-4)
@@ -573,6 +735,9 @@ func (m Model) readerPane(width, height int) string {
 		lines = append(lines, labelValue("Para", item.To, available)...)
 		lines = append(lines, "", accentStyle.Render(m.spinner()+" Carregando conteúdo…"), mutedStyle.Render("Somente este arquivo será lido por completo."))
 		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+	}
+	if m.attachmentPicker {
+		return m.attachmentPickerPane(item, width, height)
 	}
 
 	var lines []string
@@ -603,6 +768,22 @@ func (m Model) readerPane(width, height int) string {
 		indicator = fmt.Sprintf("%d%%", scroll*100/max(1, maxScroll))
 	}
 	return paneBox("LEITURA", indicator, lines[scroll:end], width, height, m.focus == readerPane)
+}
+
+func (m Model) attachmentPickerPane(item *message.Message, width, height int) string {
+	available := max(10, width-4)
+	lines := []string{mutedStyle.Render(truncate(empty(item.Subject, "(sem assunto)"), available)), ""}
+	for index, entry := range item.Attachments {
+		line := fitSides(truncate(entry.Name, max(4, available-12)), formatBytes(entry.Size), available)
+		if index == m.attachmentIndex {
+			line = fillStyle(selectedStyle, "› "+line, available)
+		} else {
+			line = "  " + line
+		}
+		lines = append(lines, line, mutedStyle.Render("  "+truncate(entry.MediaType, available-2)))
+	}
+	lines = window(lines, m.attachmentIndex*2+2, paneContentHeight(height))
+	return paneBox("ANEXOS", fmt.Sprintf("%d", len(item.Attachments)), lines, width, height, true)
 }
 
 func paneBox(title, meta string, lines []string, width, height int, focused bool) string {
