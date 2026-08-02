@@ -33,22 +33,22 @@ Do not commit the generated binary.
 
 ## State of the project
 
-The initial MVP is complete and functional. It discovers Maildirs recursively,
+The initial MVP and first UI redesign are complete. It discovers Maildirs recursively,
 loads `cur/` and `new/`, parses common RFC 822/MIME mail, shows important
 headers and bodies, falls back from HTML to basic text, decodes Base64 and
 quoted-printable content, lists attachment metadata, and surfaces invalid
 messages. Tests are in `main_test.go`.
 
-The current implementation is a prototype concentrated in `main.go`. Before
-large UI additions, separate Maildir discovery, message parsing, and UI code
-into cohesive packages while keeping behavior and tests intact.
+The code is separated into `internal/maildir`, `internal/message`, and
+`internal/ui`, with the CLI in `main.go`.
 
 ## User feedback and immediate product goal
 
-The current UI works, but it is ugly and unfriendly. Large folders become a
-giant plain list, there is no search, and opening a message replaces the list,
-which loses context. The next milestone is explicitly a visual and interaction
-redesign.
+The initial user feedback was that the functional prototype was ugly and
+unfriendly. The first redesign now provides responsive master-detail panes,
+styled focus and selection, snippets, automatic preview, folder ranking, and
+interactive `/` search. The next UI work should be driven by using this version
+against the real backup and polishing concrete issues found there.
 
 Target a responsive master-detail layout:
 
@@ -73,14 +73,10 @@ body/SQLite search possible, but never place an index in the Maildir.
 
 ## Recommended sequence
 
-1. Refactor the monolith with no behavior regression.
-2. Add and test semantic folder ranking.
-3. Build the responsive pane layout and style system.
-4. Add automatic selected-message preview and snippets.
-5. Add `/` search and its input/results states.
-6. Validate empty, malformed, Unicode, attachment, nested-label, long-list, and
+1. Evaluate the new layout against a real large backup.
+2. Polish spacing, colors, density, and focus behavior from that feedback.
+3. Validate empty, malformed, Unicode, attachment, nested-label, long-list, and
    small-terminal cases.
 
 Read `AGENTS.md` for the complete constraints, architecture notes, detailed UX
 brief, and definition of done. Treat it as the authoritative contributor guide.
-

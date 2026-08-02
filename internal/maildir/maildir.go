@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"mailtui/internal/message"
 )
@@ -107,8 +109,35 @@ func SortFolders(folders []Folder) {
 		if leftRank != rightRank {
 			return leftRank < rightRank
 		}
-		return strings.ToLower(folders[i].Name) < strings.ToLower(folders[j].Name)
+		return naturalLess(folders[i].Name, folders[j].Name)
 	})
+}
+
+func naturalLess(left, right string) bool {
+	a, b := []rune(strings.ToLower(left)), []rune(strings.ToLower(right))
+	for len(a) > 0 && len(b) > 0 {
+		if unicode.IsDigit(a[0]) && unicode.IsDigit(b[0]) {
+			ai, bi := 0, 0
+			for ai < len(a) && unicode.IsDigit(a[ai]) {
+				ai++
+			}
+			for bi < len(b) && unicode.IsDigit(b[bi]) {
+				bi++
+			}
+			an, _ := strconv.ParseUint(string(a[:ai]), 10, 64)
+			bn, _ := strconv.ParseUint(string(b[:bi]), 10, 64)
+			if an != bn {
+				return an < bn
+			}
+			a, b = a[ai:], b[bi:]
+			continue
+		}
+		if a[0] != b[0] {
+			return a[0] < b[0]
+		}
+		a, b = a[1:], b[1:]
+	}
+	return len(a) < len(b)
 }
 
 func folderRank(name string) int {

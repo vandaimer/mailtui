@@ -40,7 +40,8 @@ The static Linux amd64 build is currently about 3.5 MB.
 
 ## Current implementation
 
-The MVP lives in `main.go` and currently provides:
+The code is split across `internal/maildir`, `internal/message`, and
+`internal/ui`, with the CLI in `main.go`. It currently provides:
 
 - recursive discovery of directories containing `cur/`, `new/`, and `tmp/`;
 - lazy loading of messages when a folder is opened;
@@ -51,20 +52,20 @@ The MVP lives in `main.go` and currently provides:
 - display of From, To, Cc, Bcc, Subject, Date, and Message-ID;
 - attachment name, MIME type, and decoded size;
 - visible invalid-message entries instead of aborting a folder load;
-- keyboard navigation through folders, message lists, and a reader screen.
+- semantic folder ordering with INBOX and Gmail/system folders first;
+- a styled responsive three/two/one-pane master-detail interface;
+- automatic selected-message previews and compact message snippets;
+- keyboard navigation and `/` filtering over subject and address headers.
 
-Tests in `main_test.go` cover Maildir discovery, MIME parsing, attachments, HTML
-fallback, and Base64 bodies.
+Tests alongside each internal package cover Maildir discovery and ordering,
+MIME parsing, attachments, HTML fallback, Base64 bodies, search interaction,
+selection-driven preview, and responsive rendering decisions.
 
-## Current UX problem
+## Current UX status
 
-The MVP is functional but intentionally crude. It uses three separate full
-screen states and renders large plain lists. On a real Inbox this feels sparse,
-unfriendly, and visually poor. There is no search. Opening a message takes an
-extra navigation step and removes the surrounding list context.
-
-The next work should prioritize product-quality interaction and visual design,
-not merely add more parsing features.
+The first redesign milestone is implemented. Real-backup evaluation is now the
+most important input: polish density, colors, sizing, focus behavior, snippets,
+and edge cases based on actual use rather than returning to a full-screen list.
 
 ## Desired UX direction
 
@@ -100,33 +101,24 @@ with folder-local filtering over subject, sender, and recipients. Design the
 model so body search and a separate SQLite index can be added later without
 writing anywhere inside the Maildir.
 
-## Suggested refactor before expanding UI
-
-`main.go` is a 500+ line prototype. Split responsibilities while preserving
-behavior and tests. A sensible direction is:
+## Current package structure
 
 ```text
-cmd/mailtui/           CLI entry point
-internal/maildir/      discovery and read-only filesystem access
-internal/message/      RFC 822/MIME parsing and view models
-internal/ui/           Bubble Tea model, panes, styles, and key handling
+main.go                 CLI entry point
+internal/maildir/       discovery, ordering, and read-only filesystem access
+internal/message/       RFC 822/MIME parsing and view models
+internal/ui/            Bubble Tea model, panes, styles, search, key handling
 ```
-
-This structure is guidance, not a requirement. Prefer small cohesive packages,
-dependency direction toward the parsing/domain layer, and tests alongside each
-package. Do not start the visual redesign by layering more code into the
-monolithic file.
 
 ## Near-term execution order
 
-1. Refactor the existing code without changing behavior; keep tests green.
-2. Introduce folder ranking with INBOX and Gmail folders first, with tests.
-3. Build a responsive two/three-pane shell and a coherent style system.
-4. Add selection-driven message preview and message snippets.
-5. Add `/` search with subject/from/to filtering and explicit search state.
-6. Test with a synthetic Maildir containing nested labels, malformed messages,
+1. Evaluate the redesigned UI against a real large backup and collect concrete
+   visual/interaction feedback.
+2. Test with a synthetic Maildir containing nested labels, malformed messages,
    multipart alternatives, attachments, long Unicode headers, and many rows.
-7. Only then consider SQLite full-text indexing, attachment export, external
+3. Improve MIME charset handling and HTML conversion where real mail exposes
+   deficiencies.
+4. Only then consider SQLite full-text indexing, attachment export, external
    opening, configuration files, or richer HTML conversion.
 
 ## Definition of done for the redesign milestone
@@ -151,4 +143,3 @@ monolithic file.
   against the user's real backup.
 - If a design decision is ambiguous, optimize for comfortable inspection of a
   large Gmail backup, strong visual hierarchy, and obvious read-only behavior.
-

@@ -16,10 +16,23 @@ projeto para instalar. Não há acesso ao Gmail, OAuth, IMAP ou SMTP. O programa
 apenas percorre diretórios e abre as mensagens de `cur/` e `new/` para leitura;
 `tmp/` só é usado para reconhecer a estrutura.
 
-Teclas: `↑/↓` ou `j/k` navegam, `Enter` abre, `Esc` ou `←` volta, `PgUp/PgDn`
-rolam mensagens longas e `q` sai.
+Em terminais largos, a interface mostra simultaneamente pastas, mensagens e a
+prévia do e-mail selecionado. Em larguras médias a lista e a leitura ficam
+empilhadas; em terminais estreitos, cada painel ocupa a tela para continuar
+legível.
 
-Nesta primeira versão são exibidos as pastas, mensagens, headers principais,
-corpo `text/plain` (com fallback simples de HTML para texto) e metadados dos
-anexos MIME. Mensagens ilegíveis aparecem como inválidas, ajudando a verificar
-a integridade do backup sem interromper a navegação.
+Teclas:
+
+- `↑/↓` ou `j/k`: navegar no painel em foco;
+- `Tab`, `Shift+Tab`, `←/→` ou `h/l`: mudar o foco;
+- `/`: buscar por assunto, remetente ou destinatários;
+- `Enter`: confirmar a busca ou avançar para o próximo painel;
+- `Esc`: cancelar a busca, limpar o filtro ou voltar;
+- `PgUp/PgDn`: rolar o corpo da mensagem;
+- `q`: sair.
+
+`INBOX` aparece primeiro, seguida pelas pastas Gmail/sistema e pelas labels do
+usuário em ordem natural. São exibidos headers principais, corpo `text/plain`
+(com fallback simples de HTML para texto) e metadados dos anexos MIME.
+Mensagens ilegíveis aparecem como inválidas, ajudando a verificar a integridade
+do backup sem interromper a navegação.

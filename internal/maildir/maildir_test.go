@@ -33,13 +33,13 @@ func TestDiscoverAndLoad(t *testing.T) {
 }
 
 func TestSortFolders(t *testing.T) {
-	folders := []Folder{{Name: "Vodafone"}, {Name: "[Gmail]/Trash"}, {Name: "alpha"}, {Name: "INBOX"}, {Name: "Gmail/Sent"}}
+	folders := []Folder{{Name: "Vodafone"}, {Name: "Label 10"}, {Name: "[Gmail]/Trash"}, {Name: "Label 2"}, {Name: "alpha"}, {Name: "INBOX"}, {Name: "Gmail/Sent"}}
 	SortFolders(folders)
 	var names []string
 	for _, folder := range folders {
 		names = append(names, folder.Name)
 	}
-	want := []string{"INBOX", "[Gmail]/Trash", "Gmail/Sent", "alpha", "Vodafone"}
+	want := []string{"INBOX", "[Gmail]/Trash", "Gmail/Sent", "alpha", "Label 2", "Label 10", "Vodafone"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("names = %#v, want %#v", names, want)
 	}
