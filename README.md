@@ -36,6 +36,19 @@ curl -fsSL https://raw.githubusercontent.com/vandaimer/mailtui/master/install.sh
 It downloads the latest binary for your operating system and architecture,
 verifies its SHA-256 checksum, and installs it to `~/.local/bin/mailtui`.
 
+After the initial installation, Linux and macOS users can update the executable
+they are currently running with:
+
+```sh
+mailtui update
+```
+
+The update command checks the latest GitHub release, downloads the matching
+archive, verifies its published SHA-256 checksum, and then replaces the current
+executable. It is the only mailtui command that performs network access. If you
+run `./mailtui update` inside a source checkout, it updates that local binary;
+run the `mailtui` found in your `PATH` to update the installed copy.
+
 If `~/.local/bin` is not already in your `PATH`, add it to your shell:
 
 ```sh
@@ -130,6 +143,22 @@ Then start the application with no argument:
 ```sh
 mailtui
 ```
+
+To see the active default configuration path and configured Maildir:
+
+```sh
+mailtui config
+```
+
+To read a different configuration file for one invocation:
+
+```sh
+mailtui --config ~/.config/mailtui/work.toml
+```
+
+Run `mailtui help` or `mailtui --help` for a concise setup guide. When no
+Maildir argument is given and the default configuration does not exist,
+mailtui shows that guide instead of exiting with an opaque error.
 
 An explicit path still takes precedence over the configuration:
 
