@@ -11,7 +11,12 @@ SMTP configuration is required.
 
 - Browse folders, messages, and the selected email in a responsive interface.
 - Search the current folder by subject, sender, or recipient.
-- Read common RFC 822 and MIME messages, including encoded headers and bodies.
+- Read common RFC 822 and MIME messages, including encoded headers, charsets,
+  and transfer encodings.
+- Render HTML email as styled terminal content with headings, emphasis, lists,
+  links, quotations, code, and tables.
+- Preview PNG, JPEG, and GIF images stored inside the message without making
+  network requests.
 - See attachment names, types, and sizes, then open them with the default app.
 - Navigate large backups on local or network-mounted filesystems without
   blocking the interface.
@@ -116,6 +121,7 @@ followed by Gmail system folders and regular labels.
 | `Enter` | Apply search or move to the next pane |
 | `Esc` | Cancel search, clear the filter, or go back |
 | `PgUp` / `PgDn` | Scroll the message body |
+| `v` | Toggle between rich HTML and plain-text views |
 | `o` | Open the attachment picker |
 | `q` | Quit |
 
@@ -154,11 +160,19 @@ ${XDG_CACHE_HOME:-~/.cache}/mailtui/metadata-v1/
 If a folder has not changed, the next visit reuses that cache. Deleting the
 cache is safe; mailtui recreates it when needed.
 
-## Current email rendering
+## Rich email and images
 
-mailtui prefers the `text/plain` MIME body. If a message only contains HTML, it
-converts that content to basic readable text. Rich HTML formatting and remote
-images are not currently rendered.
+When an email includes HTML, mailtui converts it into structured Markdown and
+renders it with terminal-native colors and styles. Press `v` at any time to
+switch to the original `text/plain` alternative when one is available.
+
+Images included in the MIME message are decoded into small true-color terminal
+previews. Only compact thumbnails are kept in memory; the original payload is
+still extracted on demand through the attachment picker.
+
+Remote images are never downloaded. This preserves offline operation and avoids
+contacting tracking pixels. Their alternative text and links remain visible in
+the rich view when provided by the sender.
 
 Unreadable or malformed messages remain visible as invalid entries so you can
 inspect the integrity of the backup without interrupting navigation.

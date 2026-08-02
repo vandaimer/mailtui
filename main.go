@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"mailtui/internal/maildir"
 	"mailtui/internal/ui"
@@ -42,7 +42,7 @@ func run(args []string) error {
 		return fmt.Errorf("no Maildir folders found under %s", root)
 	}
 
-	_, err = tea.NewProgram(ui.New(root, folders), tea.WithAltScreen()).Run()
+	_, err = tea.NewProgram(ui.New(root, folders)).Run()
 	return err
 }
 

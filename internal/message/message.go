@@ -9,6 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"image"
+	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -18,12 +23,32 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
+	"golang.org/x/text/encoding/htmlindex"
+	"golang.org/x/text/transform"
 )
 
 type Attachment struct {
 	Name      string
 	MediaType string
 	Size      int
+	ContentID string
+	Inline    bool
+}
+
+// ImagePreview is a small, decoded thumbnail kept for terminal rendering. It
+// deliberately stores only a few pixels rather than retaining attachment data.
+type ImagePreview struct {
+	Name      string
+	MediaType string
+	ContentID string
+	Width     int
+	Height    int
+	Pixels    []color.NRGBA
 }
 
 type Message struct {
@@ -37,7 +62,9 @@ type Message struct {
 	Date        time.Time
 	DateText    string
 	Body        string
+	RichBody    string
 	Attachments []Attachment
+	Images      []ImagePreview
 	Err         error
 	Loaded      bool
 }
@@ -85,8 +112,14 @@ func ParseFile(path string) (Message, error) {
 	}
 	parts, attachments, err := extractParts(mediaType, params, body)
 	m.Attachments = attachments
+	m.Images = parts.images
 	if err != nil {
 		return m, err
+	}
+	if parts.html != "" {
+		if richBody, richErr := htmlToMarkdown(parts.html); richErr == nil {
+			m.RichBody = strings.TrimSpace(richBody)
+		}
 	}
 	if parts.plain != "" {
 		m.Body = parts.plain
@@ -170,12 +203,16 @@ func findAttachment(mediaType string, params map[string]string, data []byte, tar
 		if filename == "" {
 			filename = decodeHeader(partParams["name"])
 		}
+		contentID := normalizeContentID(part.Header.Get("Content-ID"))
 		if disposition == "attachment" || filename != "" {
 			if filename == "" {
 				filename = "unnamed-attachment"
 			}
 			if *seen == target {
-				return Attachment{Name: filename, MediaType: partType, Size: len(partData)}, partData, true, nil
+				return Attachment{
+					Name: filename, MediaType: partType, Size: len(partData),
+					ContentID: contentID, Inline: disposition == "inline",
+				}, partData, true, nil
 			}
 			*seen++
 			continue
@@ -210,7 +247,18 @@ func decodeHeader(value string) string {
 	return decoded
 }
 
-type textParts struct{ plain, html string }
+type textParts struct {
+	plain, html string
+	images      []ImagePreview
+}
+
+const (
+	maxImagePreviews   = 8
+	maxPreviewBytes    = 16 * 1024 * 1024
+	maxPreviewPixels   = 40_000_000
+	previewPixelWidth  = 48
+	previewPixelHeight = 24
+)
 
 func extractParts(mediaType string, params map[string]string, data []byte) (textParts, []Attachment, error) {
 	var texts textParts
@@ -247,11 +295,22 @@ func extractParts(mediaType string, params map[string]string, data []byte) (text
 			if filename == "" {
 				filename = decodeHeader(partParams["name"])
 			}
+			contentID := normalizeContentID(part.Header.Get("Content-ID"))
+			previewedImage := false
+			if strings.HasPrefix(partType, "image/") && len(texts.images) < maxImagePreviews {
+				if preview, ok := makeImagePreview(filename, partType, contentID, partData); ok {
+					texts.images = append(texts.images, preview)
+					previewedImage = true
+				}
+			}
 			if disposition == "attachment" || filename != "" {
 				if filename == "" {
 					filename = "unnamed-attachment"
 				}
-				attachments = append(attachments, Attachment{Name: filename, MediaType: partType, Size: len(partData)})
+				attachments = append(attachments, Attachment{
+					Name: filename, MediaType: partType, Size: len(partData),
+					ContentID: contentID, Inline: disposition == "inline",
+				})
 				continue
 			}
 
@@ -264,15 +323,29 @@ func extractParts(mediaType string, params map[string]string, data []byte) (text
 					texts.html = nested.html
 				}
 				attachments = append(attachments, nestedAttachments...)
+				if !previewedImage {
+					remaining := maxImagePreviews - len(texts.images)
+					if remaining > len(nested.images) {
+						remaining = len(nested.images)
+					}
+					if remaining > 0 {
+						texts.images = append(texts.images, nested.images[:remaining]...)
+					}
+				}
 			}
 		}
 		return texts, attachments, nil
 	}
 	if mediaType == "text/plain" {
-		texts.plain = string(data)
+		texts.plain = string(decodeCharset(data, params["charset"]))
 	}
 	if mediaType == "text/html" {
-		texts.html = string(data)
+		texts.html = string(decodeCharset(data, params["charset"]))
+	}
+	if strings.HasPrefix(mediaType, "image/") {
+		if preview, ok := makeImagePreview(decodeHeader(params["name"]), mediaType, "", data); ok {
+			texts.images = append(texts.images, preview)
+		}
 	}
 	return texts, attachments, nil
 }
@@ -297,4 +370,75 @@ func htmlToText(value string) string {
 	value = breaks.ReplaceAllString(value, "\n")
 	value = tags.ReplaceAllString(value, "")
 	return strings.TrimSpace(html.UnescapeString(value))
+}
+
+func htmlToMarkdown(value string) (string, error) {
+	conv := converter.NewConverter(
+		converter.WithPlugins(
+			base.NewBasePlugin(),
+			commonmark.NewCommonmarkPlugin(),
+			table.NewTablePlugin(table.WithHeaderPromotion(true)),
+		),
+	)
+	return conv.ConvertString(value)
+}
+
+func decodeCharset(data []byte, label string) []byte {
+	label = strings.TrimSpace(strings.ToLower(label))
+	if label == "" || label == "utf-8" || label == "us-ascii" {
+		return data
+	}
+	encoding, err := htmlindex.Get(label)
+	if err != nil {
+		return data
+	}
+	decoded, err := io.ReadAll(transform.NewReader(bytes.NewReader(data), encoding.NewDecoder()))
+	if err != nil {
+		return data
+	}
+	return decoded
+}
+
+func normalizeContentID(value string) string {
+	return strings.Trim(strings.TrimSpace(value), "<>")
+}
+
+func makeImagePreview(name, mediaType, contentID string, data []byte) (ImagePreview, bool) {
+	if len(data) == 0 || len(data) > maxPreviewBytes {
+		return ImagePreview{}, false
+	}
+	configuration, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || configuration.Width <= 0 || configuration.Height <= 0 ||
+		configuration.Width > maxPreviewPixels/configuration.Height {
+		return ImagePreview{}, false
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return ImagePreview{}, false
+	}
+
+	width, height := configuration.Width, configuration.Height
+	scale := min(1.0, min(float64(previewPixelWidth)/float64(width), float64(previewPixelHeight)/float64(height)))
+	thumbnailWidth := max(1, int(float64(width)*scale))
+	thumbnailHeight := max(1, int(float64(height)*scale))
+	pixels := make([]color.NRGBA, 0, thumbnailWidth*thumbnailHeight)
+	bounds := decoded.Bounds()
+	for y := range thumbnailHeight {
+		sourceY := bounds.Min.Y + y*bounds.Dy()/thumbnailHeight
+		for x := range thumbnailWidth {
+			sourceX := bounds.Min.X + x*bounds.Dx()/thumbnailWidth
+			pixels = append(pixels, color.NRGBAModel.Convert(decoded.At(sourceX, sourceY)).(color.NRGBA))
+		}
+	}
+	if strings.TrimSpace(name) == "" {
+		if contentID != "" {
+			name = contentID
+		} else {
+			name = "Inline image"
+		}
+	}
+	return ImagePreview{
+		Name: name, MediaType: mediaType, ContentID: contentID,
+		Width: thumbnailWidth, Height: thumbnailHeight, Pixels: pixels,
+	}, true
 }

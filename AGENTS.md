@@ -26,8 +26,10 @@ The application must never connect to Gmail and must never alter the backup.
 ## Current stack and commands
 
 - Go 1.26.1 (managed by `mise.toml`)
-- Bubble Tea for the terminal event loop
-- Go standard library for Maildir discovery and RFC 822/MIME parsing
+- Bubble Tea v2 for the terminal event loop
+- Lip Gloss v2 for layout and application chrome
+- Glamour v2 for ANSI Markdown rendering
+- html-to-markdown v2 and Go MIME packages for email interpretation
 
 ```sh
 go test ./...
@@ -35,8 +37,6 @@ go vet ./...
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o mailtui .
 ./mailtui /path/to/mail
 ```
-
-The static Linux amd64 build is currently about 3.5 MB.
 
 ## Current implementation
 
@@ -47,7 +47,9 @@ The code is split across `internal/maildir`, `internal/message`, and
 - lazy loading of messages when a folder is opened;
 - descending date sort inside a folder;
 - decoding of encoded headers;
-- `text/plain` display with a simple HTML-to-text fallback;
+- rich HTML-to-Markdown rendering with a plain-text toggle;
+- MIME charset conversion to UTF-8;
+- bounded true-color previews for local PNG, JPEG, and GIF MIME images;
 - Base64 and quoted-printable transfer decoding;
 - display of From, To, Cc, Bcc, Subject, Date, and Message-ID;
 - attachment name, MIME type, and decoded size;
@@ -94,6 +96,11 @@ Attachment opening is explicitly user-triggered with `o`. The selected MIME
 part is decoded again, sanitized with `filepath.Base`, written with mode 0600
 under the user cache, and handed to the platform opener. Never materialize
 attachments under the Maildir or trust a MIME filename as a path.
+
+Remote HTML images must never be fetched automatically. Rich rendering may show
+their link or alternative text, but only MIME-local image payloads may become
+terminal previews. Preview decoding is bounded by input size, source pixel
+count, image count, and thumbnail dimensions.
 
 ## Current UX status
 
@@ -150,8 +157,7 @@ internal/ui/            Bubble Tea model, panes, styles, search, key handling
    visual/interaction feedback.
 2. Test with a synthetic Maildir containing nested labels, malformed messages,
    multipart alternatives, attachments, long Unicode headers, and many rows.
-3. Improve MIME charset handling and HTML conversion where real mail exposes
-   deficiencies.
+3. Improve MIME and rich rendering where real mail exposes deficiencies.
 4. Only then consider SQLite full-text indexing, attachment export, external
    opening, configuration files, or richer HTML conversion.
 

@@ -20,8 +20,9 @@ or any path below the supplied root. There must be no send/reply/move/delete
 features and no Gmail, OAuth, IMAP, or SMTP integration. If a later feature
 needs an index or cache, put it outside the mail root.
 
-The project uses Go 1.26.1 and Bubble Tea so it can ship as one static native
-binary. Build and validate with:
+The project uses Go 1.26.1, Bubble Tea v2, Lip Gloss v2, Glamour v2, and an
+HTML-to-Markdown converter while still shipping as one native binary. Build and
+validate with:
 
 ```sh
 go test ./...
@@ -33,11 +34,16 @@ Do not commit the generated binary.
 
 ## State of the project
 
-The initial MVP and first UI redesign are complete. It discovers Maildirs recursively,
-loads `cur/` and `new/`, parses common RFC 822/MIME mail, shows important
-headers and bodies, falls back from HTML to basic text, decodes Base64 and
-quoted-printable content, lists attachment metadata, and surfaces invalid
-messages. Tests are in `main_test.go`.
+The initial MVP and first UI redesign are complete. It discovers Maildirs
+recursively, loads `cur/` and `new/`, parses common RFC 822/MIME mail, shows
+important headers and bodies, decodes Base64 and quoted-printable content,
+lists attachment metadata, and surfaces invalid messages. Tests live beside
+the packages they cover.
+
+Selected messages now preserve plain and HTML alternatives, decode legacy MIME
+charsets, render HTML as styled Markdown, and expose bounded true-color previews
+for MIME-local PNG, JPEG, and GIF images. `v` toggles rich/plain display. Never
+fetch remote HTML image URLs.
 
 The code is separated into `internal/maildir`, `internal/message`, and
 `internal/ui`, with the CLI in `main.go`.

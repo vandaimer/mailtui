@@ -8,8 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"mailtui/internal/attachment"
 	"mailtui/internal/maildir"
@@ -67,10 +67,21 @@ type Model struct {
 	attachmentPicker          bool
 	attachmentIndex           int
 	openingAttachment         bool
+	plainBody                 bool
+	bodyRenderCache           map[bodyRenderKey][]string
+}
+
+type bodyRenderKey struct {
+	path  string
+	width int
+	plain bool
 }
 
 func New(root string, folders []maildir.Folder) Model {
-	return Model{root: root, folders: folders, focus: foldersPane, metadata: metadata.New(root)}
+	return Model{
+		root: root, folders: folders, focus: foldersPane, metadata: metadata.New(root),
+		bodyRenderCache: make(map[bodyRenderKey][]string),
+	}
 }
 
 type folderLoadRequest struct{ path string }
@@ -111,6 +122,9 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
 	case tea.WindowSizeMsg:
+		if m.width != value.Width {
+			m.bodyRenderCache = make(map[bodyRenderKey][]string)
+		}
 		m.width, m.height = value.Width, value.Height
 	case folderLoadRequest:
 		if value.path != m.selectedFolderPath() || m.selectedFolderLoaded() || m.loadingFolder == value.path {
@@ -168,7 +182,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loadingFolder != "" || m.loadingMessage != "" || m.openingAttachment {
 			return m, spinnerCmd()
 		}
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if m.attachmentPicker {
 			return m.updateAttachmentPicker(value)
 		}
@@ -180,7 +194,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) updateAttachmentPicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) updateAttachmentPicker(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	selected := m.selectedMessage()
 	if selected == nil || len(selected.Attachments) == 0 {
 		m.attachmentPicker = false
@@ -203,7 +217,7 @@ func (m Model) updateAttachmentPicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) updateSearch(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) updateSearch(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -226,8 +240,8 @@ func (m Model) updateSearch(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.messageIndex = 0
 		m.readerScroll = 0
 	default:
-		if key.Type == tea.KeyRunes {
-			m.query += string(key.Runes)
+		if key.Text != "" {
+			m.query += key.Text
 			m.messageIndex = 0
 			m.readerScroll = 0
 		}
@@ -235,7 +249,7 @@ func (m Model) updateSearch(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, m.queueSelectedMessage(messageDebounce)
 }
 
-func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) updateNavigation(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch key.String() {
 	case "ctrl+c", "q":
@@ -254,6 +268,19 @@ func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focus = readerPane
 		} else {
 			m.status = "The selected message has no attachments"
+		}
+	case "v":
+		selected := m.selectedMessage()
+		if selected == nil || !selected.Loaded || strings.TrimSpace(selected.RichBody) == "" {
+			m.status = "This message has no rich HTML view"
+			break
+		}
+		m.plainBody = !m.plainBody
+		m.readerScroll = 0
+		if m.plainBody {
+			m.status = "Plain-text view"
+		} else {
+			m.status = "Rich HTML view"
 		}
 	case "tab":
 		m.focus = (m.focus + 1) % 3
@@ -541,7 +568,13 @@ func (m Model) selectedMessage() *message.Message {
 	return &m.folders[m.folderIndex].Messages[matches[selected]]
 }
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
+	view := tea.NewView(m.viewContent())
+	view.AltScreen = true
+	return view
+}
+
+func (m Model) viewContent() string {
 	if m.width == 0 {
 		return "Loading…"
 	}
@@ -582,7 +615,7 @@ func (m Model) footerView() string {
 		right := mutedStyle.Render(fmt.Sprintf("%d result(s)  Enter apply  Esc cancel", count))
 		return fitSides(left, right, m.width)
 	}
-	left := softStyle.Render("Tab/←→ focus  ↑↓ navigate  / search  o attachments  Esc back")
+	left := softStyle.Render("Tab/←→ focus  ↑↓ navigate  / search  v view  o attachments  Esc back")
 	if m.loadingFolder != "" {
 		left = accentStyle.Render(m.spinner()+" Reading headers…") + "  " + left
 	} else if m.loadingMessage != "" {
@@ -758,16 +791,33 @@ func (m Model) readerPane(width, height int) string {
 		}
 	}
 	lines = append(lines, "", mutedStyle.Render(strings.Repeat("─", available)), "")
-	lines = append(lines, wrap(item.Body, available)...)
+	lines = append(lines, m.renderedMessageContent(item, available)...)
 
 	maxScroll := max(0, len(lines)-contentHeight)
 	scroll := clamp(m.readerScroll, 0, maxScroll)
 	end := min(len(lines), scroll+contentHeight)
-	indicator := ""
+	indicator := "PLAIN"
+	if !m.plainBody && strings.TrimSpace(item.RichBody) != "" {
+		indicator = "RICH"
+	}
 	if maxScroll > 0 {
-		indicator = fmt.Sprintf("%d%%", scroll*100/max(1, maxScroll))
+		indicator += fmt.Sprintf(" · %d%%", scroll*100/max(1, maxScroll))
 	}
 	return paneBox("READER", indicator, lines[scroll:end], width, height, m.focus == readerPane)
+}
+
+func (m Model) renderedMessageContent(item *message.Message, width int) []string {
+	key := bodyRenderKey{path: item.Path, width: width, plain: m.plainBody}
+	if item.Path != "" && m.bodyRenderCache != nil {
+		if cached, found := m.bodyRenderCache[key]; found {
+			return cached
+		}
+	}
+	lines := renderMessageContent(item, width, m.plainBody)
+	if item.Path != "" && m.bodyRenderCache != nil {
+		m.bodyRenderCache[key] = lines
+	}
+	return lines
 }
 
 func (m Model) attachmentPickerPane(item *message.Message, width, height int) string {
