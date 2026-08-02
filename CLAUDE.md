@@ -90,3 +90,5 @@ body/SQLite search possible, but never place an index in the Maildir.
 
 Read `AGENTS.md` for the complete constraints, architecture notes, detailed UX
 brief, and definition of done. Treat it as the authoritative contributor guide.
+All user-facing text, documentation, comments, fixtures, and commits must remain
+in English.

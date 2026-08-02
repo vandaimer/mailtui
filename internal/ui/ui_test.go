@@ -56,7 +56,7 @@ func TestResponsiveViews(t *testing.T) {
 	if got := lipgloss.Width(wide); got != 130 {
 		t.Fatalf("wide view width = %d", got)
 	}
-	for _, label := range []string{"PASTAS", "INBOX", "LEITURA", "Primeira mensagem", "Corpo da Alice"} {
+	for _, label := range []string{"FOLDERS", "INBOX", "READER", "First message", "Alice's message body"} {
 		if !strings.Contains(wide, label) {
 			t.Fatalf("wide view missing %q", label)
 		}
@@ -67,12 +67,12 @@ func TestResponsiveViews(t *testing.T) {
 	if got := lipgloss.Width(narrow); got != 60 {
 		t.Fatalf("narrow view width = %d", got)
 	}
-	if !strings.Contains(narrow, "PASTAS") || strings.Contains(narrow, "LEITURA") {
+	if !strings.Contains(narrow, "FOLDERS") || strings.Contains(narrow, "READER") {
 		t.Fatalf("unexpected narrow folder view")
 	}
 	m.focus = readerPane
 	narrow = m.View()
-	if !strings.Contains(narrow, "LEITURA") || !strings.Contains(narrow, "Corpo da Alice") {
+	if !strings.Contains(narrow, "READER") || !strings.Contains(narrow, "Alice's message body") {
 		t.Fatalf("unexpected narrow reader view")
 	}
 }
@@ -82,7 +82,7 @@ func TestMessageSelectionUpdatesPreview(t *testing.T) {
 	m.focus = messagesPane
 	m.move(1)
 	selected := m.selectedMessage()
-	if selected == nil || selected.Subject != "Fatura disponível" || m.readerScroll != 0 {
+	if selected == nil || selected.Subject != "Invoice available" || m.readerScroll != 0 {
 		t.Fatalf("unexpected selection: %#v", selected)
 	}
 }
@@ -112,13 +112,13 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 		t.Fatalf("folder scan did not start asynchronously: %#v", m)
 	}
 
-	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header pronto"}
+	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header ready"}
 	updated, _ = m.Update(folderLoaded{path: "/network/INBOX", messages: []message.Message{summary}})
 	m = updated.(Model)
 	if m.loadingFolder != "" || len(m.folders[0].Messages) != 1 || m.folders[0].Messages[0].Loaded {
 		t.Fatalf("unexpected header phase: %#v", m)
 	}
-	if !strings.Contains(m.View(), "Carregando conteúdo") {
+	if !strings.Contains(m.View(), "Loading content") {
 		t.Fatal("reader does not expose the deferred body load")
 	}
 
@@ -128,10 +128,10 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 		t.Fatalf("message load did not start asynchronously: %#v", m)
 	}
 	full := summary
-	full.Body, full.Loaded = "Conteúdo chegou", true
+	full.Body, full.Loaded = "Content arrived", true
 	updated, _ = m.Update(messageLoaded{path: summary.Path, message: full})
 	m = updated.(Model)
-	if m.loadingMessage != "" || !strings.Contains(m.View(), "Conteúdo chegou") {
+	if m.loadingMessage != "" || !strings.Contains(m.View(), "Content arrived") {
 		t.Fatalf("message was not hydrated: %#v", m)
 	}
 }
@@ -182,8 +182,8 @@ func testModel() Model {
 	folders := []maildir.Folder{{
 		Name: "INBOX",
 		Messages: []message.Message{
-			{From: "Alice <alice@example.com>", To: "me@example.com", Subject: "Primeira mensagem", Body: "Corpo da Alice", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local), Loaded: true},
-			{From: "Banco <bank@example.com>", To: "billing@example.com", Subject: "Fatura disponível", Body: "A sua fatura chegou.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local), Loaded: true},
+			{From: "Alice <alice@example.com>", To: "me@example.com", Subject: "First message", Body: "Alice's message body", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local), Loaded: true},
+			{From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local), Loaded: true},
 		},
 	}}
 	return Model{root: "/backup/mail", folders: folders, width: 130, height: 32}

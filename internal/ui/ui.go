@@ -145,14 +145,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(commands...)
 	case metadataSaved:
 		if value.err != nil {
-			m.status = "Não foi possível atualizar o cache local"
+			m.status = "Could not update the local cache"
 		}
 	case attachmentOpened:
 		m.openingAttachment = false
 		if value.err != nil {
-			m.status = "Não foi possível abrir o anexo: " + value.err.Error()
+			m.status = "Could not open attachment: " + value.err.Error()
 		} else {
-			m.status = "Anexo aberto: " + filepath.Base(value.path)
+			m.status = "Attachment opened: " + filepath.Base(value.path)
 		}
 	case messageLoadRequest:
 		selected := m.selectedMessage()
@@ -253,7 +253,7 @@ func (m Model) updateNavigation(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.attachmentIndex = 0
 			m.focus = readerPane
 		} else {
-			m.status = "A mensagem selecionada não possui anexos"
+			m.status = "The selected message has no attachments"
 		}
 	case "tab":
 		m.focus = (m.focus + 1) % 3
@@ -441,7 +441,7 @@ func (m *Model) storeFolderResult(result folderLoaded) {
 		m.loadingFolder = ""
 	}
 	if result.err != nil {
-		m.status = "Algumas mensagens não puderam ser lidas"
+		m.status = "Some messages could not be read"
 	} else if result.path == m.selectedFolderPath() {
 		m.status = ""
 	}
@@ -466,7 +466,7 @@ func (m *Model) appendFolderBatch(path string, batch maildir.HeaderBatch) {
 		break
 	}
 	if batch.Err != nil {
-		m.status = "Algumas mensagens não puderam ser lidas"
+		m.status = "Some messages could not be read"
 	}
 }
 
@@ -488,8 +488,8 @@ func (m *Model) storeMessageResult(result messageLoaded) {
 			if result.err != nil {
 				m.folders[folderIndex].Messages[messageIndex].Err = result.err
 				m.folders[folderIndex].Messages[messageIndex].Loaded = true
-				m.folders[folderIndex].Messages[messageIndex].Body = "[não foi possível ler o conteúdo desta mensagem]"
-				m.status = "Não foi possível carregar uma mensagem"
+				m.folders[folderIndex].Messages[messageIndex].Body = "[this message could not be loaded]"
+				m.status = "Could not load a message"
 			} else {
 				m.folders[folderIndex].Messages[messageIndex] = result.message
 			}
@@ -543,10 +543,10 @@ func (m Model) selectedMessage() *message.Message {
 
 func (m Model) View() string {
 	if m.width == 0 {
-		return "Carregando…"
+		return "Loading…"
 	}
 	if m.width < 42 || m.height < 10 {
-		return "mailtui precisa de um terminal com pelo menos 42×10\nq para sair"
+		return "mailtui needs a terminal of at least 42×10\npress q to quit"
 	}
 
 	header := m.headerView()
@@ -574,26 +574,26 @@ func (m Model) headerView() string {
 
 func (m Model) footerView() string {
 	if m.attachmentPicker {
-		return fitSides(accentStyle.Render("ANEXOS  ↑↓ selecionar  Enter abrir  Esc cancelar"), mutedStyle.Render("somente leitura"), m.width)
+		return fitSides(accentStyle.Render("ATTACHMENTS  ↑↓ select  Enter open  Esc cancel"), mutedStyle.Render("read only"), m.width)
 	}
 	if m.searching {
 		count := len(m.filteredMessageIndexes())
 		left := accentStyle.Render(" / ") + lipgloss.NewStyle().Foreground(textColor).Render(m.query+"█")
-		right := mutedStyle.Render(fmt.Sprintf("%d resultado(s)  Enter aplicar  Esc cancelar", count))
+		right := mutedStyle.Render(fmt.Sprintf("%d result(s)  Enter apply  Esc cancel", count))
 		return fitSides(left, right, m.width)
 	}
-	left := softStyle.Render("Tab/←→ foco  ↑↓ navegar  / buscar  o anexos  Esc voltar")
+	left := softStyle.Render("Tab/←→ focus  ↑↓ navigate  / search  o attachments  Esc back")
 	if m.loadingFolder != "" {
-		left = accentStyle.Render(m.spinner()+" Lendo headers…") + "  " + left
+		left = accentStyle.Render(m.spinner()+" Reading headers…") + "  " + left
 	} else if m.loadingMessage != "" {
-		left = accentStyle.Render(m.spinner()+" Lendo mensagem…") + "  " + left
+		left = accentStyle.Render(m.spinner()+" Reading message…") + "  " + left
 	} else if m.openingAttachment {
-		left = accentStyle.Render(m.spinner()+" Abrindo anexo…") + "  " + left
+		left = accentStyle.Render(m.spinner()+" Opening attachment…") + "  " + left
 	}
 	if m.status != "" {
 		left = lipgloss.NewStyle().Foreground(warning).Render("⚠ "+m.status) + "  " + left
 	}
-	right := mutedStyle.Render("q sair")
+	right := mutedStyle.Render("q quit")
 	return fitSides(left, right, m.width)
 }
 
@@ -652,16 +652,16 @@ func (m Model) folderPane(width, height int) string {
 		lines = append(lines, line)
 	}
 	if len(lines) == 0 {
-		lines = []string{mutedStyle.Render("Nenhuma pasta encontrada")}
+		lines = []string{mutedStyle.Render("No folders found")}
 	}
 	lines = window(lines, m.folderIndex, contentHeight)
-	return paneBox("PASTAS", fmt.Sprintf("%d", len(m.folders)), lines, width, height, m.focus == foldersPane)
+	return paneBox("FOLDERS", fmt.Sprintf("%d", len(m.folders)), lines, width, height, m.focus == foldersPane)
 }
 
 func (m Model) messagesPane(width, height int) string {
 	if !m.selectedFolderLoaded() {
-		lines := []string{"", accentStyle.Render(m.spinner() + " Carregando mensagens"), mutedStyle.Render("Lendo somente os headers do Maildir…")}
-		return paneBox("MENSAGENS", "", lines, width, height, m.focus == messagesPane)
+		lines := []string{"", accentStyle.Render(m.spinner() + " Loading messages"), mutedStyle.Render("Reading Maildir headers only…")}
+		return paneBox("MESSAGES", "", lines, width, height, m.focus == messagesPane)
 	}
 	matches := m.filteredMessageIndexes()
 	contentHeight := paneContentHeight(height)
@@ -673,19 +673,19 @@ func (m Model) messagesPane(width, height int) string {
 	var lines []string
 	if len(matches) == 0 {
 		if m.query != "" {
-			lines = []string{"", accentStyle.Render("Nenhum resultado"), mutedStyle.Render("Tente outro termo de busca.")}
+			lines = []string{"", accentStyle.Render("No results"), mutedStyle.Render("Try another search term.")}
 		} else {
-			lines = []string{"", mutedStyle.Render("Esta pasta está vazia.")}
+			lines = []string{"", mutedStyle.Render("This folder is empty.")}
 		}
 	} else {
 		for position := start; position < end; position++ {
 			item := m.folders[m.folderIndex].Messages[matches[position]]
 			available := max(10, width-4)
 			first := fitSides(truncate(displaySender(item.From), max(4, available-10)), displayDate(item.Date), available)
-			second := truncate(empty(item.Subject, "(sem assunto)"), available)
+			second := truncate(empty(item.Subject, "(no subject)"), available)
 			preview := snippet(item.Body)
 			if !item.Loaded {
-				preview = "Selecione para carregar a prévia"
+				preview = "Select to load the preview"
 			}
 			third := truncate(preview, available)
 			if position == selected {
@@ -699,7 +699,7 @@ func (m Model) messagesPane(width, height int) string {
 			}
 		}
 	}
-	folderName := "MENSAGENS"
+	folderName := "MESSAGES"
 	if len(m.folders) > 0 {
 		folderName = truncate(strings.ToUpper(maildir.DisplayName(m.folders[m.folderIndex].Name)), 22)
 	}
@@ -709,50 +709,50 @@ func (m Model) messagesPane(width, height int) string {
 
 func (m Model) readerPane(width, height int) string {
 	if !m.selectedFolderLoaded() {
-		lines := []string{"", accentStyle.Render(m.spinner() + " Preparando pasta"), mutedStyle.Render("A interface continua disponível durante a leitura.")}
-		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+		lines := []string{"", accentStyle.Render(m.spinner() + " Preparing folder"), mutedStyle.Render("The interface remains responsive while loading.")}
+		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
 	}
 	if m.loadingFolder != "" && m.loadingFolder == m.selectedFolderPath() {
-		lines := []string{"", accentStyle.Render(m.spinner() + " Recebendo mensagens em lotes"), mutedStyle.Render(fmt.Sprintf("%d headers disponíveis até agora…", m.folderMessageCount()))}
-		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+		lines := []string{"", accentStyle.Render(m.spinner() + " Receiving message batches"), mutedStyle.Render(fmt.Sprintf("%d headers available so far…", m.folderMessageCount()))}
+		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
 	}
 	item := m.selectedMessage()
 	contentHeight := paneContentHeight(height)
 	available := max(10, width-4)
 	if item == nil {
-		lines := []string{"", accentStyle.Render("Nenhuma mensagem selecionada"), mutedStyle.Render("Escolha uma mensagem ou ajuste a busca.")}
-		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+		lines := []string{"", accentStyle.Render("No message selected"), mutedStyle.Render("Choose a message or adjust your search.")}
+		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
 	}
 	if item.Err != nil && !item.Loaded {
-		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Mensagem inválida"), mutedStyle.Render(truncate(item.Err.Error(), available))}
-		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Invalid message"), mutedStyle.Render(truncate(item.Err.Error(), available))}
+		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
 	}
 	if !item.Loaded {
 		lines := []string{
-			titleStyle.Render(truncate(empty(item.Subject, "(sem assunto)"), available)),
+			titleStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)),
 		}
-		lines = append(lines, labelValue("De", item.From, available)...)
-		lines = append(lines, labelValue("Para", item.To, available)...)
-		lines = append(lines, "", accentStyle.Render(m.spinner()+" Carregando conteúdo…"), mutedStyle.Render("Somente este arquivo será lido por completo."))
-		return paneBox("LEITURA", "", lines, width, height, m.focus == readerPane)
+		lines = append(lines, labelValue("From", item.From, available)...)
+		lines = append(lines, labelValue("To", item.To, available)...)
+		lines = append(lines, "", accentStyle.Render(m.spinner()+" Loading content…"), mutedStyle.Render("Only this file will be read in full."))
+		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
 	}
 	if m.attachmentPicker {
 		return m.attachmentPickerPane(item, width, height)
 	}
 
 	var lines []string
-	lines = append(lines, titleStyle.Render(truncate(empty(item.Subject, "(sem assunto)"), available)))
-	lines = append(lines, labelValue("De", item.From, available)...)
-	lines = append(lines, labelValue("Para", item.To, available)...)
+	lines = append(lines, titleStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)))
+	lines = append(lines, labelValue("From", item.From, available)...)
+	lines = append(lines, labelValue("To", item.To, available)...)
 	if item.Cc != "" {
 		lines = append(lines, labelValue("Cc", item.Cc, available)...)
 	}
 	if item.Bcc != "" {
 		lines = append(lines, labelValue("Bcc", item.Bcc, available)...)
 	}
-	lines = append(lines, labelValue("Data", item.DateText, available)...)
+	lines = append(lines, labelValue("Date", item.DateText, available)...)
 	if len(item.Attachments) > 0 {
-		lines = append(lines, "", accentStyle.Render(fmt.Sprintf("▣ %d anexo(s)", len(item.Attachments))))
+		lines = append(lines, "", accentStyle.Render(fmt.Sprintf("▣ %d attachment(s)", len(item.Attachments))))
 		for _, attachment := range item.Attachments {
 			lines = append(lines, truncate(fmt.Sprintf("  %s · %s · %s", attachment.Name, attachment.MediaType, formatBytes(attachment.Size)), available))
 		}
@@ -767,12 +767,12 @@ func (m Model) readerPane(width, height int) string {
 	if maxScroll > 0 {
 		indicator = fmt.Sprintf("%d%%", scroll*100/max(1, maxScroll))
 	}
-	return paneBox("LEITURA", indicator, lines[scroll:end], width, height, m.focus == readerPane)
+	return paneBox("READER", indicator, lines[scroll:end], width, height, m.focus == readerPane)
 }
 
 func (m Model) attachmentPickerPane(item *message.Message, width, height int) string {
 	available := max(10, width-4)
-	lines := []string{mutedStyle.Render(truncate(empty(item.Subject, "(sem assunto)"), available)), ""}
+	lines := []string{mutedStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)), ""}
 	for index, entry := range item.Attachments {
 		line := fitSides(truncate(entry.Name, max(4, available-12)), formatBytes(entry.Size), available)
 		if index == m.attachmentIndex {
@@ -783,7 +783,7 @@ func (m Model) attachmentPickerPane(item *message.Message, width, height int) st
 		lines = append(lines, line, mutedStyle.Render("  "+truncate(entry.MediaType, available-2)))
 	}
 	lines = window(lines, m.attachmentIndex*2+2, paneContentHeight(height))
-	return paneBox("ANEXOS", fmt.Sprintf("%d", len(item.Attachments)), lines, width, height, true)
+	return paneBox("ATTACHMENTS", fmt.Sprintf("%d", len(item.Attachments)), lines, width, height, true)
 }
 
 func paneBox(title, meta string, lines []string, width, height int, focused bool) string {
@@ -903,7 +903,7 @@ func displaySender(value string) string {
 	if before, _, found := strings.Cut(value, "<"); found && strings.TrimSpace(before) != "" {
 		return strings.Trim(strings.TrimSpace(before), "\"")
 	}
-	return empty(value, "Remetente desconhecido")
+	return empty(value, "Unknown sender")
 }
 
 func displayDate(value time.Time) string {
@@ -922,7 +922,7 @@ func displayDate(value time.Time) string {
 
 func snippet(value string) string {
 	clean := strings.Join(strings.Fields(value), " ")
-	return empty(clean, "Sem prévia de texto")
+	return empty(clean, "No text preview")
 }
 
 func formatBytes(size int) string {

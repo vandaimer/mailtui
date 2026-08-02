@@ -19,7 +19,7 @@ import (
 func ExtractToCache(messagePath string, index int) (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil || base == "" {
-		return "", errors.New("diretório de cache do usuário indisponível")
+		return "", errors.New("user cache directory is unavailable")
 	}
 	return ExtractTo(messagePath, index, filepath.Join(base, "mailtui", "attachments"))
 }
@@ -61,7 +61,7 @@ func ExtractTo(messagePath string, index int, destination string) (string, error
 func OpenDefault(path string) error {
 	binary, err := exec.LookPath("xdg-open")
 	if err != nil {
-		return errors.New("xdg-open não está instalado")
+		return errors.New("xdg-open is not installed")
 	}
 	command := exec.Command(binary, path)
 	if err := command.Start(); err != nil {
@@ -81,7 +81,7 @@ func safeName(name string) string {
 	}, name)
 	name = strings.TrimSpace(name)
 	if name == "" || name == "." {
-		return "anexo-sem-nome"
+		return "unnamed-attachment"
 	}
 	runes := []rune(name)
 	if len(runes) > 180 {

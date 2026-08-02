@@ -34,7 +34,7 @@ func Discover(root string) ([]Folder, error) {
 		return nil, err
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("não é um diretório: %s", root)
+		return nil, fmt.Errorf("not a directory: %s", root)
 	}
 
 	var result []Folder
@@ -172,7 +172,7 @@ func scanHeaderBatches(paths []string, batchSize int, output chan<- HeaderBatch)
 			for path := range jobs {
 				parsed, parseErr := message.ParseHeaderFile(path)
 				if parseErr != nil {
-					parsed = message.Message{Path: path, Subject: "[mensagem inválida]", Err: parseErr}
+					parsed = message.Message{Path: path, Subject: "[invalid message]", Err: parseErr}
 				}
 				results <- result{message: parsed, err: parseErr}
 			}

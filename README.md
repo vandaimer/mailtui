@@ -1,61 +1,62 @@
 # mailtui
 
-Leitor TUI, offline e **somente leitura**, para backups de e-mail em formato
-Maildir. A raiz pode conter várias pastas/labels; cada diretório que possua
-`cur/`, `new/` e `tmp/` é descoberto automaticamente.
+A fast, offline, **read-only** TUI for browsing email backups stored in Maildir
+format. The root may contain multiple folders or labels; every directory with
+`cur/`, `new/`, and `tmp/` is discovered automatically.
 
-## Uso
+## Usage
 
 ```sh
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o mailtui .
 ./mailtui /mnt/mail
 ```
 
-O resultado é um único executável estático, sem runtime ou bibliotecas do
-projeto para instalar. Não há acesso ao Gmail, OAuth, IMAP ou SMTP. O programa
-apenas percorre diretórios e abre as mensagens de `cur/` e `new/` para leitura;
-`tmp/` só é usado para reconhecer a estrutura.
+The build produces a single static executable with no project runtime or
+libraries to install. The application does not access Gmail, OAuth, IMAP, or
+SMTP. It only lists directories and reads messages from `cur/` and `new/`;
+`tmp/` is used solely to recognize the Maildir structure.
 
-Em terminais largos, a interface mostra simultaneamente pastas, mensagens e a
-prévia do e-mail selecionado. Em larguras médias a lista e a leitura ficam
-empilhadas; em terminais estreitos, cada painel ocupa a tela para continuar
-legível.
+On wide terminals, the interface displays folders, messages, and the selected
+email preview at the same time. On medium widths, the message list and reader
+are stacked. On narrow terminals, each pane takes over the screen to remain
+legible.
 
-Teclas:
+Keys:
 
-- `↑/↓` ou `j/k`: navegar no painel em foco;
-- `Tab`, `Shift+Tab`, `←/→` ou `h/l`: mudar o foco;
-- `/`: buscar por assunto, remetente ou destinatários;
-- `Enter`: confirmar a busca ou avançar para o próximo painel;
-- `Esc`: cancelar a busca, limpar o filtro ou voltar;
-- `PgUp/PgDn`: rolar o corpo da mensagem;
-- `o`: escolher e abrir um anexo com o aplicativo padrão;
-- `q`: sair.
+- `↑/↓` or `j/k`: navigate the focused pane;
+- `Tab`, `Shift+Tab`, `←/→`, or `h/l`: change focus;
+- `/`: search by subject, sender, or recipients;
+- `Enter`: apply the search or move to the next pane;
+- `Esc`: cancel search, clear the filter, or go back;
+- `PgUp/PgDn`: scroll the message body;
+- `o`: select and open an attachment with the default application;
+- `q`: quit.
 
-`INBOX` aparece primeiro, seguida pelas pastas Gmail/sistema e pelas labels do
-usuário em ordem natural. São exibidos headers principais, corpo `text/plain`
-(com fallback simples de HTML para texto) e metadados dos anexos MIME.
-Mensagens ilegíveis aparecem como inválidas, ajudando a verificar a integridade
-do backup sem interromper a navegação.
+`INBOX` is listed first, followed by Gmail/system folders and user labels in
+natural order. The reader displays important headers, the `text/plain` body
+(with a basic HTML-to-text fallback), and MIME attachment metadata. Unreadable
+messages remain visible as invalid entries, which helps verify backup integrity
+without interrupting navigation.
 
-## Backups em rede
+## Network backups
 
-A navegação nunca espera por I/O no loop da interface. Ao selecionar uma pasta,
-o programa lê apenas os headers das mensagens, com concorrência limitada, e
-mantém o resultado em memória. O corpo MIME completo — incluindo anexos — só é
-lido para a mensagem selecionada. Pequenas pausas na seleção usam debounce para
-que atravessar rapidamente a lista de pastas ou mensagens não dispare leituras
-desnecessárias no ponto de montagem remoto.
+Navigation never waits for filesystem I/O in the interface event loop. When a
+folder is selected, mailtui reads only message headers with bounded concurrency
+and keeps the results in memory. The complete MIME body—including attachment
+payloads—is read only for the selected message. Selection is debounced so that
+moving quickly through folders or messages does not trigger unnecessary reads
+from a remote mount.
 
-Na primeira leitura de uma pasta, os headers aparecem progressivamente em
-lotes. Ao terminar, o programa guarda somente esses metadados em
-`~/.cache/mailtui/metadata-v1/`. Nas execuções seguintes ele compara a lista de
-arquivos do Maildir e reutiliza o cache se ela não mudou. Nenhum índice ou cache
-é criado dentro do backup.
+During the first folder scan, headers appear progressively in batches. When the
+scan completes, mailtui stores only those metadata summaries under
+`${XDG_CACHE_HOME:-~/.cache}/mailtui/metadata-v1/`. On later runs it compares
+the Maildir filename list and reuses the cache when nothing changed. No index or
+cache is ever created inside the backup.
 
-## Anexos
+## Attachments
 
-Com uma mensagem carregada, pressione `o`, escolha o anexo e confirme com
-`Enter`. O conteúdo é decodificado para `~/.cache/mailtui/attachments/` com
-permissões restritas e aberto via `xdg-open` — por exemplo, um PDF vai para o
-visualizador padrão do desktop. Os arquivos originais permanecem intactos.
+Once a message has loaded, press `o`, select an attachment, and press `Enter`.
+The payload is decoded into
+`${XDG_CACHE_HOME:-~/.cache}/mailtui/attachments/` with restricted permissions
+and opened through `xdg-open`. For example, a PDF opens in the desktop's default
+PDF viewer. Original Maildir files remain untouched.

@@ -167,6 +167,8 @@ internal/ui/            Bubble Tea model, panes, styles, search, key handling
 
 ## Working conventions
 
+- Keep all user-facing text, documentation, code comments, test fixtures, and
+  commit messages in English.
 - Run `gofmt` on edited Go files and run `go test ./...` before committing.
 - Also run `go vet ./...` for meaningful changes.
 - Preserve user changes and keep commits focused.

@@ -94,7 +94,7 @@ func ParseFile(path string) (Message, error) {
 		m.Body = htmlToText(parts.html)
 	}
 	if strings.TrimSpace(m.Body) == "" {
-		m.Body = "[sem corpo de texto]"
+		m.Body = "[no text body]"
 	}
 	return m, nil
 }
@@ -103,7 +103,7 @@ func ParseFile(path string) (Message, error) {
 // in Message.Attachments. It performs no writes.
 func ExtractAttachment(path string, target int) (Attachment, []byte, error) {
 	if target < 0 {
-		return Attachment{}, nil, errors.New("índice de anexo inválido")
+		return Attachment{}, nil, errors.New("invalid attachment index")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -131,7 +131,7 @@ func ExtractAttachment(path string, target int) (Attachment, []byte, error) {
 		return Attachment{}, nil, err
 	}
 	if !found {
-		return Attachment{}, nil, fmt.Errorf("anexo %d não encontrado", target+1)
+		return Attachment{}, nil, fmt.Errorf("attachment %d not found", target+1)
 	}
 	return attachment, payload, nil
 }
@@ -142,7 +142,7 @@ func findAttachment(mediaType string, params map[string]string, data []byte, tar
 	}
 	boundary := params["boundary"]
 	if boundary == "" {
-		return Attachment{}, nil, false, errors.New("multipart sem boundary")
+		return Attachment{}, nil, false, errors.New("multipart message has no boundary")
 	}
 	reader := multipart.NewReader(bytes.NewReader(data), boundary)
 	for {
@@ -172,7 +172,7 @@ func findAttachment(mediaType string, params map[string]string, data []byte, tar
 		}
 		if disposition == "attachment" || filename != "" {
 			if filename == "" {
-				filename = "anexo-sem-nome"
+				filename = "unnamed-attachment"
 			}
 			if *seen == target {
 				return Attachment{Name: filename, MediaType: partType, Size: len(partData)}, partData, true, nil
@@ -218,7 +218,7 @@ func extractParts(mediaType string, params map[string]string, data []byte) (text
 	if strings.HasPrefix(mediaType, "multipart/") {
 		boundary := params["boundary"]
 		if boundary == "" {
-			return texts, nil, errors.New("multipart sem boundary")
+			return texts, nil, errors.New("multipart message has no boundary")
 		}
 		reader := multipart.NewReader(bytes.NewReader(data), boundary)
 		for {
@@ -249,7 +249,7 @@ func extractParts(mediaType string, params map[string]string, data []byte) (text
 			}
 			if disposition == "attachment" || filename != "" {
 				if filename == "" {
-					filename = "anexo-sem-nome"
+					filename = "unnamed-attachment"
 				}
 				attachments = append(attachments, Attachment{Name: filename, MediaType: partType, Size: len(partData)})
 				continue

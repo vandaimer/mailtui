@@ -20,7 +20,7 @@ func run(args []string) error {
 		return err
 	}
 	if flags.NArg() != 1 {
-		return errors.New("uso: mailtui DIRETÓRIO_MAILDIR")
+		return errors.New("usage: mailtui MAILDIR_ROOT")
 	}
 
 	root, err := filepath.Abs(flags.Arg(0))
@@ -32,7 +32,7 @@ func run(args []string) error {
 		return err
 	}
 	if len(folders) == 0 {
-		return fmt.Errorf("nenhuma pasta Maildir encontrada em %s", root)
+		return fmt.Errorf("no Maildir folders found under %s", root)
 	}
 
 	_, err = tea.NewProgram(ui.New(root, folders), tea.WithAltScreen()).Run()
