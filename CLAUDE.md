@@ -50,7 +50,12 @@ not reintroduce synchronous folder parsing or full-file reads for list rows.
 Header scans stream batches of 64 and persist header-only summaries under the
 user cache, keyed by a fingerprint of Maildir paths. Attachments are extracted
 only after explicit `o`/Enter interaction, sanitized, written outside Maildir,
-and opened with `xdg-open`.
+and opened with the platform's default application.
+
+GitHub Actions run formatting, tests, vetting, and a static build on pushes and
+pull requests. Tags matching `v*` build checksummed Linux, macOS, and Windows
+archives and publish a GitHub release. `install.sh` installs a selected release
+on Linux or macOS and verifies its SHA-256 checksum before copying the binary.
 
 ## User feedback and immediate product goal
 

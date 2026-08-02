@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release assets
+        run: ./scripts/build-release.sh "$GITHUB_REF_NAME"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "mailtui $GITHUB_REF_NAME"
+
+      - name: Verify published installer
+        run: |
+          ./install.sh \
+            --repo "$GITHUB_REPOSITORY" \
+            --version "$GITHUB_REF_NAME" \
+            --dir "$RUNNER_TEMP/bin"
+          test "$("$RUNNER_TEMP/bin/mailtui" --version)" = "mailtui $GITHUB_REF_NAME"

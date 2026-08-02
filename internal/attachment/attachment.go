@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"unicode"
@@ -59,11 +61,23 @@ func ExtractTo(messagePath string, index int, destination string) (string, error
 }
 
 func OpenDefault(path string) error {
-	binary, err := exec.LookPath("xdg-open")
-	if err != nil {
-		return errors.New("xdg-open is not installed")
+	var name string
+	var args []string
+	switch runtime.GOOS {
+	case "linux":
+		name, args = "xdg-open", []string{path}
+	case "darwin":
+		name, args = "open", []string{path}
+	case "windows":
+		name, args = "rundll32", []string{"url.dll,FileProtocolHandler", path}
+	default:
+		return fmt.Errorf("opening attachments is not supported on %s", runtime.GOOS)
 	}
-	command := exec.Command(binary, path)
+	binary, err := exec.LookPath(name)
+	if err != nil {
+		return fmt.Errorf("%s is not installed", name)
+	}
+	command := exec.Command(binary, args...)
 	if err := command.Start(); err != nil {
 		return err
 	}

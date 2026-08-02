@@ -11,6 +11,18 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o mailtui .
 ./mailtui /mnt/mail
 ```
 
+Install a published release on Linux or macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/OWNER/mailtui/main/install.sh | \
+  sh -s -- --repo OWNER/mailtui
+```
+
+The installer detects the operating system and architecture, verifies the
+release checksum, and installs to `~/.local/bin` by default. Use `--dir PATH`,
+`--version vX.Y.Z`, or the corresponding `MAILTUI_*` environment variables to
+override its settings.
+
 The build produces a single static executable with no project runtime or
 libraries to install. The application does not access Gmail, OAuth, IMAP, or
 SMTP. It only lists directories and reads messages from `cur/` and `new/`;
@@ -58,5 +70,19 @@ cache is ever created inside the backup.
 Once a message has loaded, press `o`, select an attachment, and press `Enter`.
 The payload is decoded into
 `${XDG_CACHE_HOME:-~/.cache}/mailtui/attachments/` with restricted permissions
-and opened through `xdg-open`. For example, a PDF opens in the desktop's default
-PDF viewer. Original Maildir files remain untouched.
+and opened through the platform's default application. For example, a PDF opens
+in the default PDF viewer. Original Maildir files remain untouched.
+
+## Releases
+
+Every pushed `vX.Y.Z` tag runs the release workflow, tests the project, builds
+static binaries for Linux, macOS, and Windows on amd64 and arm64, writes SHA-256
+checksums, and creates a GitHub release with generated notes.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The regular CI workflow checks formatting, runs the race-enabled test suite and
+`go vet`, and verifies a static build on every push and pull request.

@@ -13,11 +13,18 @@ import (
 	"mailtui/internal/ui"
 )
 
+var version = "dev"
+
 func run(args []string) error {
 	flags := flag.NewFlagSet("mailtui", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
+	showVersion := flags.Bool("version", false, "print version and exit")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *showVersion {
+		fmt.Fprintln(os.Stdout, "mailtui "+version)
+		return nil
 	}
 	if flags.NArg() != 1 {
 		return errors.New("usage: mailtui MAILDIR_ROOT")

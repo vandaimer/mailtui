@@ -61,7 +61,9 @@ The code is split across `internal/maildir`, `internal/message`, and
 - progressive header batches and a fingerprinted metadata cache under the
   user's cache directory for fast repeat visits;
 - safe on-demand attachment extraction outside Maildir and opening through
-  `xdg-open` from the attachment picker.
+  the platform default application from the attachment picker;
+- release automation for Linux, macOS, and Windows, plus a checksum-verifying
+  installer for Linux and macOS.
 
 Tests alongside each internal package cover Maildir discovery and ordering,
 MIME parsing, attachments, HTML fallback, Base64 bodies, search interaction,
@@ -89,8 +91,8 @@ downloads. A future persistent index must still live outside the Maildir.
 
 Attachment opening is explicitly user-triggered with `o`. The selected MIME
 part is decoded again, sanitized with `filepath.Base`, written with mode 0600
-under the user cache, and handed to `xdg-open`. Never materialize attachments
-under the Maildir or trust a MIME filename as a path.
+under the user cache, and handed to the platform opener. Never materialize
+attachments under the Maildir or trust a MIME filename as a path.
 
 ## Current UX status
 
