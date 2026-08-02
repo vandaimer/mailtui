@@ -110,6 +110,38 @@ Pass `mail/`, not an individual message file. Every nested directory containing
 `cur/`, `new/`, and `tmp/` is detected as a folder. `INBOX` is shown first,
 followed by Gmail system folders and regular labels.
 
+### Default backup directory
+
+To run `mailtui` without typing the backup path every time, create the following
+configuration file:
+
+```text
+${XDG_CONFIG_HOME:-~/.config}/mailtui/config.toml
+```
+
+Add the default Maildir root in TOML format:
+
+```toml
+maildir = "~/.local/share/mail/mbsync"
+```
+
+Then start the application with no argument:
+
+```sh
+mailtui
+```
+
+An explicit path still takes precedence over the configuration:
+
+```sh
+mailtui /mnt/another-mail-backup
+```
+
+On macOS and Windows, the file lives under the standard user configuration
+directory reported by the operating system, in the `mailtui/config.toml`
+subdirectory. mailtui only reads this file and never writes configuration or
+data inside the Maildir.
+
 ## Controls
 
 | Key | Action |

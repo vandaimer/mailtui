@@ -9,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"mailtui/internal/config"
 	"mailtui/internal/maildir"
 	"mailtui/internal/ui"
 )
@@ -26,11 +27,11 @@ func run(args []string) error {
 		fmt.Fprintln(os.Stdout, "mailtui "+version)
 		return nil
 	}
-	if flags.NArg() != 1 {
-		return errors.New("usage: mailtui MAILDIR_ROOT")
+	if flags.NArg() > 1 {
+		return errors.New("usage: mailtui [MAILDIR_ROOT]")
 	}
 
-	root, err := filepath.Abs(flags.Arg(0))
+	root, err := resolveRoot(flags.Args())
 	if err != nil {
 		return err
 	}
@@ -44,6 +45,35 @@ func run(args []string) error {
 
 	_, err = tea.NewProgram(ui.New(root, folders)).Run()
 	return err
+}
+
+func resolveRoot(args []string) (string, error) {
+	var root string
+	if len(args) == 1 {
+		root = args[0]
+	} else {
+		configPath, err := config.FilePath()
+		if err != nil {
+			return "", err
+		}
+		cfg, err := config.LoadFile(configPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", fmt.Errorf("no Maildir root provided; pass one as an argument or create %s", configPath)
+			}
+			return "", fmt.Errorf("load configuration %s: %w", configPath, err)
+		}
+		root, err = config.ExpandHome(cfg.Maildir)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	return root, nil
 }
 
 func main() {
