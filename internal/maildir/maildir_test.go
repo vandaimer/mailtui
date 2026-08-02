@@ -1,6 +1,7 @@
 package maildir
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -51,6 +52,51 @@ func TestSortFolders(t *testing.T) {
 func TestDisplayName(t *testing.T) {
 	if got := DisplayName("Labels/Invoices"); got != "Labels › Invoices" {
 		t.Fatalf("DisplayName = %q", got)
+	}
+}
+
+func TestHeaderBatchesAreProgressive(t *testing.T) {
+	root := t.TempDir()
+	makeMaildir(t, root)
+	var paths []string
+	for index := range 5 {
+		path := filepath.Join(root, "cur", fmt.Sprintf("message-%d", index))
+		raw := fmt.Sprintf("Subject: Message %d\r\nDate: Fri, 0%d Aug 2025 12:00:00 +0200\r\n\r\nBody", index, index+1)
+		if err := os.WriteFile(path, []byte(raw), 0o444); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, path)
+	}
+	var sizes []int
+	var total int
+	for batch := range ScanHeaderBatches(paths, 2) {
+		sizes = append(sizes, len(batch.Messages))
+		total += len(batch.Messages)
+		if batch.Done && total != 5 {
+			t.Fatalf("done emitted before all messages: %d", total)
+		}
+	}
+	if total != 5 || len(sizes) != 3 {
+		t.Fatalf("batch sizes = %#v, total = %d", sizes, total)
+	}
+}
+
+func TestMessagePathFingerprintChangesWithDirectoryEntries(t *testing.T) {
+	root := t.TempDir()
+	makeMaildir(t, root)
+	_, before, err := ListMessagePaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "new", "new-message"), []byte("Subject: New\r\n\r\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	paths, after, err := ListMessagePaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after || len(paths) != 1 {
+		t.Fatalf("fingerprint did not change: %q %q", before, after)
 	}
 }
 

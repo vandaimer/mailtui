@@ -3,6 +3,8 @@
 package maildir
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -82,9 +84,38 @@ func Load(folder *Folder) error {
 	return err
 }
 
+type HeaderBatch struct {
+	Messages []message.Message
+	Err      error
+	Done     bool
+}
+
 // ScanHeaders lists cur/new and parses only message headers. Workers overlap
 // network latency, but the fixed cap avoids flooding remote filesystems.
 func ScanHeaders(folderPath string) ([]message.Message, error) {
+	paths, _, listErr := ListMessagePaths(folderPath)
+	if listErr != nil && len(paths) == 0 {
+		return []message.Message{}, listErr
+	}
+	var messages []message.Message
+	var errs []error
+	if listErr != nil {
+		errs = append(errs, listErr)
+	}
+	for batch := range ScanHeaderBatches(paths, 64) {
+		messages = append(messages, batch.Messages...)
+		if batch.Err != nil {
+			errs = append(errs, batch.Err)
+		}
+	}
+	SortMessages(messages)
+	return messages, errors.Join(errs...)
+}
+
+// ListMessagePaths performs only directory listing and returns a fingerprint
+// suitable for validating a local metadata cache. Maildir messages are
+// immutable; changes and flag updates appear as filename changes.
+func ListMessagePaths(folderPath string) ([]string, string, error) {
 	var paths []string
 	var errs []error
 	for _, bucket := range []string{"cur", "new"} {
@@ -100,16 +131,38 @@ func ScanHeaders(folderPath string) ([]message.Message, error) {
 			paths = append(paths, filepath.Join(folderPath, bucket, entry.Name()))
 		}
 	}
-	if len(paths) == 0 {
-		return []message.Message{}, errors.Join(errs...)
+	sort.Strings(paths)
+	hash := sha256.New()
+	for _, path := range paths {
+		_, _ = hash.Write([]byte(path))
+		_, _ = hash.Write([]byte{0})
 	}
+	return paths, hex.EncodeToString(hash.Sum(nil)), errors.Join(errs...)
+}
 
+// ScanHeaderBatches parses headers concurrently and emits bounded progressive
+// batches. The final value always has Done set, including for an empty folder.
+func ScanHeaderBatches(paths []string, batchSize int) <-chan HeaderBatch {
+	output := make(chan HeaderBatch)
+	if batchSize < 1 {
+		batchSize = 64
+	}
+	go scanHeaderBatches(paths, batchSize, output)
+	return output
+}
+
+func scanHeaderBatches(paths []string, batchSize int, output chan<- HeaderBatch) {
+	defer close(output)
+	if len(paths) == 0 {
+		output <- HeaderBatch{Done: true}
+		return
+	}
 	type result struct {
 		message message.Message
 		err     error
 	}
 	jobs := make(chan string)
-	results := make(chan result, len(paths))
+	results := make(chan result, min(len(paths), 128))
 	workers := min(12, len(paths))
 	var group sync.WaitGroup
 	for range workers {
@@ -134,17 +187,28 @@ func ScanHeaders(folderPath string) ([]message.Message, error) {
 		close(results)
 	}()
 
-	messages := make([]message.Message, 0, len(paths))
+	messages := make([]message.Message, 0, batchSize)
+	var errs []error
 	for parsed := range results {
 		messages = append(messages, parsed.message)
 		if parsed.err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", parsed.message.Path, parsed.err))
 		}
+		if len(messages) >= batchSize {
+			SortMessages(messages)
+			output <- HeaderBatch{Messages: messages, Err: errors.Join(errs...)}
+			messages = make([]message.Message, 0, batchSize)
+			errs = nil
+		}
 	}
+	SortMessages(messages)
+	output <- HeaderBatch{Messages: messages, Err: errors.Join(errs...), Done: true}
+}
+
+func SortMessages(messages []message.Message) {
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].Date.After(messages[j].Date)
 	})
-	return messages, errors.Join(errs...)
 }
 
 func SortFolders(folders []Folder) {
