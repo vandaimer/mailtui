@@ -61,7 +61,7 @@ func TestResponsiveViews(t *testing.T) {
 	if got := lipgloss.Height(wide); got != 32 {
 		t.Fatalf("wide view height = %d", got)
 	}
-	wideBody := m.wideView(130, 30)
+	wideBody := m.bodyView(calculateLayout(130, 32))
 	if got := lipgloss.Width(wideBody); got != 130 {
 		t.Fatalf("wide body width = %d", got)
 	}
@@ -86,6 +86,44 @@ func TestResponsiveViews(t *testing.T) {
 	narrow = m.View().Content
 	if !strings.Contains(narrow, "READER") || !strings.Contains(narrow, "Alice's message body") {
 		t.Fatalf("unexpected narrow reader view")
+	}
+}
+
+func TestReaderPagingUsesRenderedViewport(t *testing.T) {
+	for _, size := range [][2]int{{60, 32}, {72, 10}, {90, 32}, {112, 32}} {
+		m := testModel()
+		m.width, m.height = size[0], size[1]
+		m.focus = readerPane
+		viewportHeight := calculateLayout(m.width, m.height).reader.contentHeight
+
+		updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+		m = updated.(Model)
+		if m.readerScroll != viewportHeight {
+			t.Fatalf("size %dx%d: Page Down moved %d rows, want %d", m.width, m.height, m.readerScroll, viewportHeight)
+		}
+
+		m.readerScroll = viewportHeight * 2
+		updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+		m = updated.(Model)
+		if m.readerScroll != viewportHeight {
+			t.Fatalf("size %dx%d: Page Up moved to %d, want %d", m.width, m.height, m.readerScroll, viewportHeight)
+		}
+	}
+}
+
+func TestResponsiveLayoutFillsBreakpointAndMinimumSizes(t *testing.T) {
+	for _, width := range []int{42, 71, 72, 111, 112} {
+		for _, height := range []int{10, 11, 32} {
+			m := testModel()
+			m.width, m.height = width, height
+			view := m.View().Content
+			if got := lipgloss.Width(view); got != width {
+				t.Errorf("size %dx%d: view width = %d", width, height, got)
+			}
+			if got := lipgloss.Height(view); got != height {
+				t.Errorf("size %dx%d: view height = %d", width, height, got)
+			}
+		}
 	}
 }
 
@@ -123,14 +161,15 @@ func TestRichMessageIsDefaultAndCanToggleToPlainText(t *testing.T) {
 	m.folders[0].Messages[0].Body = "Unique plain fallback"
 	m.folders[0].Messages[0].RichBody = "# Rich heading\n\nA **formatted** message."
 
-	rich := m.readerPane(60, 24)
+	geometry := newPaneGeometry(60, 24)
+	rich := m.readerPane(geometry)
 	if !strings.Contains(rich, "Rich") || !strings.Contains(rich, "heading") || !strings.Contains(rich, "RICH") || strings.Contains(rich, "Unique plain fallback") {
 		t.Fatalf("rich view was not selected by default:\n%s", rich)
 	}
 
 	updated, _ := m.Update(tea.KeyPressMsg{Code: 'v', Text: "v"})
 	m = updated.(Model)
-	plain := m.readerPane(60, 24)
+	plain := m.readerPane(geometry)
 	if !strings.Contains(plain, "Unique plain fallback") || !strings.Contains(plain, "PLAIN") || strings.Contains(plain, "formatted") {
 		t.Fatalf("plain view was not selected after toggle:\n%s", plain)
 	}

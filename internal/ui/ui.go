@@ -26,10 +26,8 @@ const (
 )
 
 const (
-	wideBreakpoint   = 112
-	mediumBreakpoint = 72
-	folderDebounce   = 180 * time.Millisecond
-	messageDebounce  = 120 * time.Millisecond
+	folderDebounce  = 180 * time.Millisecond
+	messageDebounce = 120 * time.Millisecond
 )
 
 var (
@@ -330,11 +328,13 @@ func (m Model) updateNavigation(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		cmd = m.move(1)
 	case "pgup":
 		if m.focus == readerPane {
-			m.readerScroll = max(0, m.readerScroll-max(1, m.readerViewportHeight()))
+			viewportHeight := calculateLayout(m.width, m.height).reader.contentHeight
+			m.readerScroll = max(0, m.readerScroll-max(1, viewportHeight))
 		}
 	case "pgdown":
 		if m.focus == readerPane {
-			m.readerScroll += max(1, m.readerViewportHeight())
+			viewportHeight := calculateLayout(m.width, m.height).reader.contentHeight
+			m.readerScroll += max(1, viewportHeight)
 		}
 	case "home":
 		cmd = m.moveToBoundary(false)
@@ -554,22 +554,14 @@ func (m Model) viewContent() string {
 	if m.width == 0 {
 		return "Loading…"
 	}
-	if m.width < 42 || m.height < 10 {
+	layout := calculateLayout(m.width, m.height)
+	if !layout.usable {
 		return "mailtui needs a terminal of at least 42×10\npress q to quit"
 	}
 
 	header := m.headerView()
 	foot := m.footerView()
-	bodyHeight := max(5, m.height-lipgloss.Height(header)-lipgloss.Height(foot))
-	var body string
-	switch {
-	case m.width >= wideBreakpoint:
-		body = m.wideView(m.width, bodyHeight)
-	case m.width >= mediumBreakpoint:
-		body = m.mediumView(m.width, bodyHeight)
-	default:
-		body = m.narrowView(m.width, bodyHeight)
-	}
+	body := m.bodyView(layout)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, foot)
 }
 
@@ -610,43 +602,35 @@ func (m Model) footerView() string {
 	return fitSides(left, right, m.width)
 }
 
-func (m Model) wideView(width, height int) string {
-	folderWidth := max(22, width*22/100)
-	messageWidth := max(34, width*32/100)
-	readerWidth := width - folderWidth - messageWidth
-	return lipgloss.JoinHorizontal(lipgloss.Top,
-		m.folderPane(folderWidth, height),
-		m.messagesPane(messageWidth, height),
-		m.readerPane(readerWidth, height),
-	)
-}
-
-func (m Model) mediumView(width, height int) string {
-	folderWidth := max(22, width*28/100)
-	detailWidth := width - folderWidth
-	listHeight := max(8, height*44/100)
-	return lipgloss.JoinHorizontal(lipgloss.Top,
-		m.folderPane(folderWidth, height),
-		lipgloss.JoinVertical(lipgloss.Left,
-			m.messagesPane(detailWidth, listHeight),
-			m.readerPane(detailWidth, height-listHeight),
-		),
-	)
-}
-
-func (m Model) narrowView(width, height int) string {
-	switch m.focus {
-	case foldersPane:
-		return m.folderPane(width, height)
-	case messagesPane:
-		return m.messagesPane(width, height)
+func (m Model) bodyView(layout layoutPlan) string {
+	switch layout.mode {
+	case wideLayout:
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			m.folderPane(layout.folders),
+			m.messagesPane(layout.messages),
+			m.readerPane(layout.reader),
+		)
+	case mediumLayout:
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			m.folderPane(layout.folders),
+			lipgloss.JoinVertical(lipgloss.Left,
+				m.messagesPane(layout.messages),
+				m.readerPane(layout.reader),
+			),
+		)
 	default:
-		return m.readerPane(width, height)
+		switch m.focus {
+		case foldersPane:
+			return m.folderPane(layout.folders)
+		case messagesPane:
+			return m.messagesPane(layout.messages)
+		default:
+			return m.readerPane(layout.reader)
+		}
 	}
 }
 
-func (m Model) folderPane(width, height int) string {
-	contentHeight := paneContentHeight(height)
+func (m Model) folderPane(geometry paneGeometry) string {
 	lines := make([]string, 0, len(m.folders))
 	for index, folder := range m.folders {
 		name := maildir.DisplayName(folder.Name)
@@ -656,9 +640,9 @@ func (m Model) folderPane(width, height int) string {
 		} else if folder.Path == m.loadingFolder {
 			count = " " + m.spinner()
 		}
-		line := fitSides(truncate(name, max(1, width-8)), mutedStyle.Render(count), max(1, width-4))
+		line := fitSides(truncate(name, max(1, geometry.width-8)), mutedStyle.Render(count), geometry.contentWidth)
 		if index == m.folderIndex {
-			line = fillStyle(selectedStyle, "› "+line, max(1, width-4))
+			line = fillStyle(selectedStyle, "› "+line, geometry.contentWidth)
 		} else {
 			line = "  " + line
 		}
@@ -667,19 +651,18 @@ func (m Model) folderPane(width, height int) string {
 	if len(lines) == 0 {
 		lines = []string{mutedStyle.Render("No folders found")}
 	}
-	lines = window(lines, m.folderIndex, contentHeight)
-	return paneBox("FOLDERS", fmt.Sprintf("%d", len(m.folders)), lines, width, height, m.focus == foldersPane)
+	lines = window(lines, m.folderIndex, geometry.contentHeight)
+	return paneBox("FOLDERS", fmt.Sprintf("%d", len(m.folders)), lines, geometry, m.focus == foldersPane)
 }
 
-func (m Model) messagesPane(width, height int) string {
+func (m Model) messagesPane(geometry paneGeometry) string {
 	if !m.selectedFolderLoaded() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Loading messages"), mutedStyle.Render("Reading Maildir headers only…")}
-		return paneBox("MESSAGES", "", lines, width, height, m.focus == messagesPane)
+		return paneBox("MESSAGES", "", lines, geometry, m.focus == messagesPane)
 	}
 	matches := m.filteredMessageIndexes()
-	contentHeight := paneContentHeight(height)
 	rowsPerMessage := 3
-	visibleCount := max(1, contentHeight/rowsPerMessage)
+	visibleCount := max(1, geometry.contentHeight/rowsPerMessage)
 	selected := clamp(m.messageIndex, 0, max(0, len(matches)-1))
 	start := clamp(selected-visibleCount/2, 0, max(0, len(matches)-visibleCount))
 	end := min(len(matches), start+visibleCount)
@@ -693,7 +676,7 @@ func (m Model) messagesPane(width, height int) string {
 	} else {
 		for position := start; position < end; position++ {
 			item := m.folders[m.folderIndex].Messages[matches[position]]
-			available := max(10, width-4)
+			available := geometry.contentWidth
 			first := fitSides(truncate(displaySender(item.From), max(4, available-10)), displayDate(item.Date), available)
 			second := truncate(empty(item.Subject, "(no subject)"), available)
 			preview := snippet(item.Body)
@@ -717,28 +700,27 @@ func (m Model) messagesPane(width, height int) string {
 		folderName = truncate(strings.ToUpper(maildir.DisplayName(m.folders[m.folderIndex].Name)), 22)
 	}
 	count := fmt.Sprintf("%d/%d", len(matches), m.folderMessageCount())
-	return paneBox(folderName, count, lines, width, height, m.focus == messagesPane)
+	return paneBox(folderName, count, lines, geometry, m.focus == messagesPane)
 }
 
-func (m Model) readerPane(width, height int) string {
+func (m Model) readerPane(geometry paneGeometry) string {
 	if !m.selectedFolderLoaded() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Preparing folder"), mutedStyle.Render("The interface remains responsive while loading.")}
-		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
 	}
 	if m.loadingFolder != "" && m.loadingFolder == m.selectedFolderPath() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Receiving message batches"), mutedStyle.Render(fmt.Sprintf("%d headers available so far…", m.folderMessageCount()))}
-		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
 	}
 	item := m.selectedMessage()
-	contentHeight := paneContentHeight(height)
-	available := max(10, width-4)
+	available := geometry.contentWidth
 	if item == nil {
 		lines := []string{"", accentStyle.Render("No message selected"), mutedStyle.Render("Choose a message or adjust your search.")}
-		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
 	}
 	if item.Err != nil && !item.Loaded {
 		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Invalid message"), mutedStyle.Render(truncate(item.Err.Error(), available))}
-		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
 	}
 	if !item.Loaded {
 		lines := []string{
@@ -747,10 +729,10 @@ func (m Model) readerPane(width, height int) string {
 		lines = append(lines, labelValue("From", item.From, available)...)
 		lines = append(lines, labelValue("To", item.To, available)...)
 		lines = append(lines, "", accentStyle.Render(m.spinner()+" Loading content…"), mutedStyle.Render("Only this file will be read in full."))
-		return paneBox("READER", "", lines, width, height, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
 	}
 	if m.attachmentPicker {
-		return m.attachmentPickerPane(item, width, height)
+		return m.attachmentPickerPane(item, geometry)
 	}
 
 	var lines []string
@@ -773,9 +755,9 @@ func (m Model) readerPane(width, height int) string {
 	lines = append(lines, "", mutedStyle.Render(strings.Repeat("─", available)), "")
 	lines = append(lines, m.renderedMessageContent(item, available)...)
 
-	maxScroll := max(0, len(lines)-contentHeight)
+	maxScroll := max(0, len(lines)-geometry.contentHeight)
 	scroll := clamp(m.readerScroll, 0, maxScroll)
-	end := min(len(lines), scroll+contentHeight)
+	end := min(len(lines), scroll+geometry.contentHeight)
 	indicator := "PLAIN"
 	if !m.plainBody && strings.TrimSpace(item.RichBody) != "" {
 		indicator = "RICH"
@@ -783,7 +765,7 @@ func (m Model) readerPane(width, height int) string {
 	if maxScroll > 0 {
 		indicator += fmt.Sprintf(" · %d%%", scroll*100/max(1, maxScroll))
 	}
-	return paneBox("READER", indicator, lines[scroll:end], width, height, m.focus == readerPane)
+	return paneBox("READER", indicator, lines[scroll:end], geometry, m.focus == readerPane)
 }
 
 func (m Model) renderedMessageContent(item *message.Message, width int) []string {
@@ -800,8 +782,8 @@ func (m Model) renderedMessageContent(item *message.Message, width int) []string
 	return lines
 }
 
-func (m Model) attachmentPickerPane(item *message.Message, width, height int) string {
-	available := max(10, width-4)
+func (m Model) attachmentPickerPane(item *message.Message, geometry paneGeometry) string {
+	available := geometry.contentWidth
 	lines := []string{mutedStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)), ""}
 	for index, entry := range item.Attachments {
 		line := fitSides(truncate(entry.Name, max(4, available-12)), formatBytes(entry.Size), available)
@@ -812,19 +794,17 @@ func (m Model) attachmentPickerPane(item *message.Message, width, height int) st
 		}
 		lines = append(lines, line, mutedStyle.Render("  "+truncate(entry.MediaType, available-2)))
 	}
-	lines = window(lines, m.attachmentIndex*2+2, paneContentHeight(height))
-	return paneBox("ATTACHMENTS", fmt.Sprintf("%d", len(item.Attachments)), lines, width, height, true)
+	lines = window(lines, m.attachmentIndex*2+2, geometry.contentHeight)
+	return paneBox("ATTACHMENTS", fmt.Sprintf("%d", len(item.Attachments)), lines, geometry, true)
 }
 
-func paneBox(title, meta string, lines []string, width, height int, focused bool) string {
-	innerWidth := max(1, width-2)
-	innerHeight := max(1, height-2)
+func paneBox(title, meta string, lines []string, geometry paneGeometry, focused bool) string {
 	heading := accentStyle.Render(" "+title) + " "
 	if meta != "" {
-		heading = fitSides(heading, mutedStyle.Render(meta+" "), innerWidth)
+		heading = fitSides(heading, mutedStyle.Render(meta+" "), geometry.innerWidth)
 	}
 	content := heading
-	if innerHeight > 1 {
+	if geometry.innerHeight > 1 {
 		body := strings.Join(lines, "\n")
 		content += "\n" + body
 	}
@@ -833,26 +813,14 @@ func paneBox(title, meta string, lines []string, width, height int, focused bool
 		borderColor = accent
 	}
 	return lipgloss.NewStyle().
-		Width(width).
-		Height(height).
-		MaxWidth(width).
-		MaxHeight(height).
+		Width(geometry.width).
+		Height(geometry.height).
+		MaxWidth(geometry.width).
+		MaxHeight(geometry.height).
 		Foreground(textColor).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
 		Render(content)
-}
-
-func paneContentHeight(height int) int { return max(1, height-3) }
-
-func (m Model) readerViewportHeight() int {
-	if m.width >= wideBreakpoint {
-		return max(1, m.height-5)
-	}
-	if m.width >= mediumBreakpoint {
-		return max(1, (m.height-2)*56/100-3)
-	}
-	return max(1, m.height-5)
 }
 
 func (m Model) folderMessageCount() int {
