@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -59,6 +60,39 @@ func TestFolderReadEmitsSortedProgressAndPersistsMetadata(t *testing.T) {
 	cached := session.ReadFolder(session.RequestFolder(folder, false))
 	if !cached.Done || len(cached.Messages) != 2 || cached.Messages[0].Subject != "Newer" {
 		t.Fatalf("persisted metadata was not reusable: %#v", cached)
+	}
+}
+
+func TestBrowseSessionLeavesMaildirUnchanged(t *testing.T) {
+	folder, _ := syntheticMaildir(t, "Read only")
+	writeMessage(t, filepath.Join(folder, "cur", "second"), "Second", "Mon, 3 Aug 2026 12:00:00 +0200")
+	before := snapshotTree(t, folder)
+
+	folders, err := maildir.Discover(folder)
+	if err != nil || len(folders) != 1 || folders[0].Path != folder {
+		t.Fatalf("discover = %#v, %v", folders, err)
+	}
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	session := NewAt(cacheDir)
+	request := session.RequestFolder(folders[0].Path, false)
+	if started := session.ReadFolder(request); !started.Started || started.Done {
+		t.Fatalf("folder read did not start progressively: %#v", started)
+	}
+	completed := readFolderToCompletion(t, session, request)
+	if completed.CacheErr != nil || len(completed.Messages) != 2 {
+		t.Fatalf("folder read = %#v", completed)
+	}
+	hydrated := session.ReadMessage(session.RequestMessage(completed.Messages[0]))
+	if hydrated.Stale || hydrated.Message.LoadState() != message.LoadContentReady {
+		t.Fatalf("message hydration = %#v", hydrated)
+	}
+	if entries, readErr := os.ReadDir(cacheDir); readErr != nil || len(entries) == 0 {
+		t.Fatalf("external metadata cache was not written: entries=%d err=%v", len(entries), readErr)
+	}
+
+	after := snapshotTree(t, folder)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("browse session changed Maildir\nbefore: %#v\nafter:  %#v", before, after)
 	}
 }
 
@@ -269,4 +303,41 @@ func writeMessage(t *testing.T, path, subject, date string) {
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type treeEntry struct {
+	Mode    os.FileMode
+	Content string
+}
+
+func snapshotTree(t *testing.T, root string) map[string]treeEntry {
+	t.Helper()
+	snapshot := make(map[string]treeEntry)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		item := treeEntry{Mode: info.Mode()}
+		if info.Mode().IsRegular() {
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			item.Content = string(contents)
+		}
+		snapshot[relative] = item
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -197,6 +198,55 @@ func TestMessageSelectionUpdatesPreview(t *testing.T) {
 	selected := m.selectedMessage()
 	if selected == nil || selected.Subject != "Invoice available" || m.interaction.readerScroll != 0 {
 		t.Fatalf("unexpected selection: %#v", selected)
+	}
+}
+
+func TestMessageNavigationWithPathsIsNotUndoneByReconciliation(t *testing.T) {
+	m := testModel()
+	m.interaction.focus = messagesPane
+	for index := range m.folders[0].Messages {
+		m.folders[0].Messages[index].Path = fmt.Sprintf("/mail/INBOX/cur/%d", index)
+	}
+	m.reconcileInteraction()
+
+	for _, test := range []struct {
+		name string
+		key  tea.KeyPressMsg
+		want int
+	}{
+		{name: "down", key: tea.KeyPressMsg{Code: tea.KeyDown}, want: 1},
+		{name: "home", key: tea.KeyPressMsg{Code: tea.KeyHome}, want: 0},
+		{name: "end", key: tea.KeyPressMsg{Code: tea.KeyEnd}, want: 1},
+		{name: "up", key: tea.KeyPressMsg{Code: tea.KeyUp}, want: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			updated, _ := m.Update(test.key)
+			m = updated.(Model)
+			if m.interaction.messageCursor != test.want || m.interaction.selectedKey != m.folders[0].Messages[test.want].Path {
+				t.Fatalf("cursor/key = %d/%q, want %d/%q", m.interaction.messageCursor, m.interaction.selectedKey, test.want, m.folders[0].Messages[test.want].Path)
+			}
+		})
+	}
+}
+
+func TestSearchQueryResetWithPathsKeepsIntentionalFirstResult(t *testing.T) {
+	m := testModel()
+	m.interaction.focus = messagesPane
+	m.folders[0].Messages[0].Path = "/mail/INBOX/cur/alice"
+	m.folders[0].Messages[1].Path = "/mail/INBOX/cur/bank"
+	m.interaction.messageCursor = 1
+	m.reconcileInteraction()
+
+	updated, _ := m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
+	m = updated.(Model)
+
+	if len(m.filteredMessageIndexes()) != 2 {
+		t.Fatalf("query should retain both messages, got %d", len(m.filteredMessageIndexes()))
+	}
+	if selected := m.selectedMessage(); selected == nil || selected.Path != "/mail/INBOX/cur/alice" || m.interaction.messageCursor != 0 {
+		t.Fatalf("query reset was undone: selected=%#v interaction=%#v", selected, m.interaction)
 	}
 }
 

@@ -283,6 +283,7 @@ func (state *interactionState) move(delta int, context interactionContext, outco
 		if next != state.messageCursor {
 			state.messageCursor = next
 			state.readerScroll = 0
+			state.selectedKey = ""
 			outcome.messageRead = readDeferred
 		}
 	case readerPane:
@@ -311,6 +312,7 @@ func (state *interactionState) moveToBoundary(end bool, context interactionConte
 			state.messageCursor = 0
 		}
 		state.readerScroll = 0
+		state.selectedKey = ""
 		outcome.messageRead = readDeferred
 	}
 }
@@ -324,6 +326,7 @@ func (state *interactionState) page(direction int, context interactionContext) {
 func (state *interactionState) resetMessageSelection() {
 	state.messageCursor = 0
 	state.readerScroll = 0
+	state.selectedKey = ""
 }
 
 func (state *interactionState) closeAttachments() {
