@@ -68,7 +68,7 @@ func (store *Store) Load(folder, fingerprint string) ([]message.Message, bool) {
 			Subject: item.Subject, MessageID: item.MessageID, Date: item.Date, DateText: item.DateText,
 		}
 		if item.Error != "" {
-			parsed.Err = errors.New(item.Error)
+			parsed = parsed.MarkHeaderInvalid(errors.New(item.Error))
 		}
 		messages = append(messages, parsed)
 	}
@@ -88,8 +88,8 @@ func (store *Store) Save(folder, fingerprint string, messages []message.Message)
 			Path: item.Path, From: item.From, To: item.To, Cc: item.Cc, Bcc: item.Bcc,
 			Subject: item.Subject, MessageID: item.MessageID, Date: item.Date, DateText: item.DateText,
 		}
-		if item.Err != nil {
-			entry.Error = item.Err.Error()
+		if item.LoadState() == message.LoadHeaderInvalid {
+			entry.Error = item.LoadError().Error()
 		}
 		cached.Messages = append(cached.Messages, entry)
 	}

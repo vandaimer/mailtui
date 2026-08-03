@@ -3,6 +3,7 @@ package message
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -124,6 +125,126 @@ func TestInlineImageCreatesSmallPreviewWithoutRetainingPayload(t *testing.T) {
 	}
 }
 
+func TestNestedMIMETraversalKeepsDisplayedAndExtractedAttachmentOrder(t *testing.T) {
+	var imageData bytes.Buffer
+	if err := png.Encode(&imageData, image.NewNRGBA(image.Rect(0, 0, 3, 2))); err != nil {
+		t.Fatal(err)
+	}
+	imagePayload := imageData.Bytes()
+	reportPayload := []byte("REPORT-PAYLOAD")
+	unnamedPayload := []byte("unnamed payload")
+
+	path := filepath.Join(t.TempDir(), "deeply-nested")
+	raw := "Subject: Nested MIME\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: multipart/alternative; boundary=alternative\r\n\r\n" +
+		"--alternative\r\nContent-Type: text/plain; charset=utf-8\r\n" +
+		"Content-Transfer-Encoding: quoted-printable\r\n\r\nNested=20plain=20body.\r\n" +
+		"--alternative\r\nContent-Type: multipart/related; boundary=related\r\n\r\n" +
+		"--related\r\nContent-Type: text/html; charset=utf-8\r\n\r\n" +
+		"<p>Nested <strong>HTML</strong> body.</p><img src=\"cid:green-logo\">\r\n" +
+		"--related\r\nContent-Type: image/png\r\n" +
+		"Content-Disposition: inline; filename*=UTF-8''gr%C3%BCn.png\r\n" +
+		"Content-ID: <green-logo>\r\nContent-Transfer-Encoding: base64\r\n\r\n" +
+		base64.StdEncoding.EncodeToString(imagePayload) + "\r\n--related--\r\n" +
+		"--alternative--\r\n" +
+		"--outer\r\nContent-Type: application/pdf\r\n" +
+		"Content-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		base64.StdEncoding.EncodeToString(reportPayload) + "\r\n" +
+		"--outer\r\nContent-Type: multipart/mixed; boundary=nested\r\n\r\n" +
+		"--nested\r\nContent-Type: application/octet-stream\r\n" +
+		"Content-Disposition: attachment\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" +
+		"unnamed=20payload\r\n--nested--\r\n" +
+		"--outer--\r\n"
+	writeMessage(t, path, raw)
+
+	parsed, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Body != "Nested plain body." {
+		t.Fatalf("plain body = %q", parsed.Body)
+	}
+	if !strings.Contains(parsed.RichBody, "**HTML**") {
+		t.Fatalf("rich body = %q", parsed.RichBody)
+	}
+	if len(parsed.Images) != 1 || parsed.Images[0].Name != "grün.png" || parsed.Images[0].ContentID != "green-logo" {
+		t.Fatalf("image previews = %#v", parsed.Images)
+	}
+
+	want := []struct {
+		name      string
+		mediaType string
+		contentID string
+		inline    bool
+		payload   []byte
+	}{
+		{name: "grün.png", mediaType: "image/png", contentID: "green-logo", inline: true, payload: imagePayload},
+		{name: "résumé.pdf", mediaType: "application/pdf", payload: reportPayload},
+		{name: "unnamed-attachment", mediaType: "application/octet-stream", payload: unnamedPayload},
+	}
+	if len(parsed.Attachments) != len(want) {
+		t.Fatalf("attachments = %#v", parsed.Attachments)
+	}
+	for index, expected := range want {
+		displayed := parsed.Attachments[index]
+		if displayed.Name != expected.name || displayed.MediaType != expected.mediaType ||
+			displayed.ContentID != expected.contentID || displayed.Inline != expected.inline ||
+			displayed.Size != len(expected.payload) {
+			t.Fatalf("displayed attachment %d = %#v", index, displayed)
+		}
+
+		extracted, payload, err := ExtractAttachment(path, index)
+		if err != nil {
+			t.Fatalf("extract attachment %d: %v", index, err)
+		}
+		if extracted != displayed {
+			t.Fatalf("attachment %d metadata differs: displayed=%#v extracted=%#v", index, displayed, extracted)
+		}
+		if !bytes.Equal(payload, expected.payload) {
+			t.Fatalf("attachment %d payload = %q, want %q", index, payload, expected.payload)
+		}
+	}
+}
+
+func TestExtractAttachmentRejectsIndexesOutsideUnifiedTraversal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "one-attachment")
+	writeMessage(t, path, "Content-Type: multipart/mixed; boundary=x\r\n\r\n"+
+		"--x\r\nContent-Type: text/plain\r\n\r\nBody\r\n"+
+		"--x\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=a.pdf\r\n\r\nA\r\n"+
+		"--x--\r\n")
+
+	for _, index := range []int{-1, 1} {
+		if _, _, err := ExtractAttachment(path, index); err == nil {
+			t.Fatalf("ExtractAttachment(%d) unexpectedly succeeded", index)
+		}
+	}
+}
+
+func TestMalformedNestedAlternativeDoesNotHideLaterAttachments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "malformed-alternative")
+	writeMessage(t, path, "Content-Type: multipart/mixed; boundary=outer\r\n\r\n"+
+		"--outer\r\nContent-Type: text/plain\r\n\r\nFallback body\r\n"+
+		"--outer\r\nContent-Type: multipart/alternative\r\n\r\nUnavailable alternative\r\n"+
+		"--outer\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=later.pdf\r\n\r\nLATER\r\n"+
+		"--outer--\r\n")
+
+	parsed, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Body != "Fallback body" || len(parsed.Attachments) != 1 || parsed.Attachments[0].Name != "later.pdf" {
+		t.Fatalf("parsed message = %#v", parsed)
+	}
+	extracted, payload, err := ExtractAttachment(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extracted != parsed.Attachments[0] || string(payload) != "LATER" {
+		t.Fatalf("extracted attachment = %#v %q", extracted, payload)
+	}
+}
+
 func TestBase64Body(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "base64")
 	writeMessage(t, path, "Subject: Encoded\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nSGVsbG8sIGJhY2t1cCE=")
@@ -143,8 +264,39 @@ func TestParseHeaderFileDoesNotHydrateBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Subject != "Lightweight" || parsed.Body != "" || parsed.Loaded {
+	if parsed.Subject != "Lightweight" || parsed.Body != "" || parsed.LoadState() != LoadHeaderOnly || !parsed.NeedsHydration() {
 		t.Fatalf("unexpected header result: %#v", parsed)
+	}
+}
+
+func TestLoadStateTransitionsAreTerminalAndKeepFailuresOutOfBody(t *testing.T) {
+	failure := errors.New("unreadable")
+	summary := Message{Path: "/mail/cur/1", From: "Alice", Subject: "Subject"}
+
+	invalid := summary.MarkHeaderInvalid(failure)
+	if invalid.LoadState() != LoadHeaderInvalid || invalid.LoadError() != failure || invalid.NeedsHydration() {
+		t.Fatalf("invalid header state = %#v", invalid)
+	}
+	unavailable := summary.MarkContentUnavailable(failure)
+	if unavailable.LoadState() != LoadContentUnavailable || unavailable.LoadError() != failure || unavailable.Body != "" || unavailable.NeedsHydration() {
+		t.Fatalf("unavailable content state = %#v", unavailable)
+	}
+	ready := summary.MarkContentReady()
+	if ready.LoadState() != LoadContentReady || ready.LoadError() != nil || ready.NeedsHydration() {
+		t.Fatalf("ready content state = %#v", ready)
+	}
+}
+
+func TestParseFileDoesNotMarkPartialMIMETraversalReady(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "malformed-multipart")
+	writeMessage(t, path, "Subject: Broken\r\nContent-Type: multipart/mixed\r\n\r\nBody")
+
+	parsed, err := ParseFile(path)
+	if err == nil {
+		t.Fatal("malformed multipart unexpectedly parsed")
+	}
+	if parsed.Subject != "Broken" || parsed.LoadState() != LoadHeaderOnly || parsed.Body != "" || len(parsed.Attachments) != 0 {
+		t.Fatalf("partial parse escaped as content: %#v", parsed)
 	}
 }
 

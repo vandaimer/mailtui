@@ -51,6 +51,18 @@ type ImagePreview struct {
 	Pixels    []color.NRGBA
 }
 
+// LoadState describes the only valid stages of a message during a read
+// session. The zero value is a successfully parsed header whose content has
+// not been read yet.
+type LoadState uint8
+
+const (
+	LoadHeaderOnly LoadState = iota
+	LoadHeaderInvalid
+	LoadContentReady
+	LoadContentUnavailable
+)
+
 type Message struct {
 	Path        string
 	From        string
@@ -65,8 +77,61 @@ type Message struct {
 	RichBody    string
 	Attachments []Attachment
 	Images      []ImagePreview
-	Err         error
-	Loaded      bool
+	loadState   LoadState
+	loadErr     error
+}
+
+func (m Message) LoadState() LoadState { return m.loadState }
+
+func (m Message) LoadError() error { return m.loadErr }
+
+func (m Message) NeedsHydration() bool {
+	return m.Path != "" && m.loadState == LoadHeaderOnly
+}
+
+// MarkHeaderInvalid records a header parse failure. It is a terminal state.
+func (m Message) MarkHeaderInvalid(err error) Message {
+	m.Body = ""
+	m.RichBody = ""
+	m.Attachments = nil
+	m.Images = nil
+	return m.transitionTo(LoadHeaderInvalid, err)
+}
+
+// MarkContentReady records a successful full-message hydration.
+func (m Message) MarkContentReady() Message {
+	return m.transitionTo(LoadContentReady, nil)
+}
+
+// MarkContentUnavailable preserves header metadata while recording a terminal
+// hydration failure. No display fallback is stored as message content.
+func (m Message) MarkContentUnavailable(err error) Message {
+	m.Body = ""
+	m.RichBody = ""
+	m.Attachments = nil
+	m.Images = nil
+	return m.transitionTo(LoadContentUnavailable, err)
+}
+
+func (m Message) transitionTo(next LoadState, err error) Message {
+	if m.loadState != LoadHeaderOnly {
+		panic("message load state is already terminal")
+	}
+	switch next {
+	case LoadContentReady:
+		if err != nil {
+			panic("ready message cannot contain a load error")
+		}
+	case LoadHeaderInvalid, LoadContentUnavailable:
+		if err == nil {
+			panic("message failure state requires an error")
+		}
+	default:
+		panic("invalid terminal message load state")
+	}
+	m.loadState = next
+	m.loadErr = err
+	return m
 }
 
 // ParseHeaderFile reads only the RFC 822 headers. It deliberately leaves the
@@ -86,50 +151,32 @@ func ParseHeaderFile(path string) (Message, error) {
 }
 
 func ParseFile(path string) (Message, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Message{}, err
-	}
-	raw, err := mail.ReadMessage(bytes.NewReader(data))
+	raw, root, err := readMIMEFile(path)
 	if err != nil {
 		return Message{}, err
 	}
 
 	m := fromHeaders(path, raw.Header)
-	m.Loaded = true
-
-	body, err := io.ReadAll(raw.Body)
+	contents, err := traverseMIME(root, true, -1)
 	if err != nil {
 		return m, err
 	}
-	body, err = decodeTransfer(body, raw.Header.Get("Content-Transfer-Encoding"))
-	if err != nil {
-		return m, err
-	}
-	mediaType, params, _ := mime.ParseMediaType(raw.Header.Get("Content-Type"))
-	if mediaType == "" {
-		mediaType = "text/plain"
-	}
-	parts, attachments, err := extractParts(mediaType, params, body)
-	m.Attachments = attachments
-	m.Images = parts.images
-	if err != nil {
-		return m, err
-	}
-	if parts.html != "" {
-		if richBody, richErr := htmlToMarkdown(parts.html); richErr == nil {
+	m.Attachments = contents.attachments
+	m.Images = contents.texts.images
+	if contents.texts.html != "" {
+		if richBody, richErr := htmlToMarkdown(contents.texts.html); richErr == nil {
 			m.RichBody = strings.TrimSpace(richBody)
 		}
 	}
-	if parts.plain != "" {
-		m.Body = parts.plain
+	if contents.texts.plain != "" {
+		m.Body = contents.texts.plain
 	} else {
-		m.Body = htmlToText(parts.html)
+		m.Body = htmlToText(contents.texts.html)
 	}
 	if strings.TrimSpace(m.Body) == "" {
 		m.Body = "[no text body]"
 	}
-	return m, nil
+	return m.MarkContentReady(), nil
 }
 
 // ExtractAttachment returns one decoded MIME attachment by the same order used
@@ -138,90 +185,38 @@ func ExtractAttachment(path string, target int) (Attachment, []byte, error) {
 	if target < 0 {
 		return Attachment{}, nil, errors.New("invalid attachment index")
 	}
-	data, err := os.ReadFile(path)
+	_, root, err := readMIMEFile(path)
 	if err != nil {
 		return Attachment{}, nil, err
+	}
+	contents, err := traverseMIME(root, false, target)
+	if err != nil {
+		return Attachment{}, nil, err
+	}
+	if target >= len(contents.attachments) {
+		return Attachment{}, nil, fmt.Errorf("attachment %d not found", target+1)
+	}
+	return contents.attachments[target], contents.targetPayload, nil
+}
+
+func readMIMEFile(path string) (*mail.Message, mimeEntity, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, mimeEntity{}, err
 	}
 	raw, err := mail.ReadMessage(bytes.NewReader(data))
 	if err != nil {
-		return Attachment{}, nil, err
+		return nil, mimeEntity{}, err
 	}
 	body, err := io.ReadAll(raw.Body)
 	if err != nil {
-		return Attachment{}, nil, err
+		return raw, mimeEntity{}, err
 	}
 	body, err = decodeTransfer(body, raw.Header.Get("Content-Transfer-Encoding"))
 	if err != nil {
-		return Attachment{}, nil, err
+		return raw, mimeEntity{}, err
 	}
-	mediaType, params, _ := mime.ParseMediaType(raw.Header.Get("Content-Type"))
-	if mediaType == "" {
-		mediaType = "text/plain"
-	}
-	seen := 0
-	attachment, payload, found, err := findAttachment(mediaType, params, body, target, &seen)
-	if err != nil {
-		return Attachment{}, nil, err
-	}
-	if !found {
-		return Attachment{}, nil, fmt.Errorf("attachment %d not found", target+1)
-	}
-	return attachment, payload, nil
-}
-
-func findAttachment(mediaType string, params map[string]string, data []byte, target int, seen *int) (Attachment, []byte, bool, error) {
-	if !strings.HasPrefix(mediaType, "multipart/") {
-		return Attachment{}, nil, false, nil
-	}
-	boundary := params["boundary"]
-	if boundary == "" {
-		return Attachment{}, nil, false, errors.New("multipart message has no boundary")
-	}
-	reader := multipart.NewReader(bytes.NewReader(data), boundary)
-	for {
-		part, err := reader.NextPart()
-		if errors.Is(err, io.EOF) {
-			return Attachment{}, nil, false, nil
-		}
-		if err != nil {
-			return Attachment{}, nil, false, err
-		}
-		partData, err := io.ReadAll(part)
-		if err != nil {
-			return Attachment{}, nil, false, err
-		}
-		partData, err = decodeTransfer(partData, part.Header.Get("Content-Transfer-Encoding"))
-		if err != nil {
-			return Attachment{}, nil, false, err
-		}
-		partType, partParams, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
-		if partType == "" {
-			partType = "text/plain"
-		}
-		disposition, dispositionParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-		filename := decodeHeader(dispositionParams["filename"])
-		if filename == "" {
-			filename = decodeHeader(partParams["name"])
-		}
-		contentID := normalizeContentID(part.Header.Get("Content-ID"))
-		if disposition == "attachment" || filename != "" {
-			if filename == "" {
-				filename = "unnamed-attachment"
-			}
-			if *seen == target {
-				return Attachment{
-					Name: filename, MediaType: partType, Size: len(partData),
-					ContentID: contentID, Inline: disposition == "inline",
-				}, partData, true, nil
-			}
-			*seen++
-			continue
-		}
-		attachment, payload, found, nestedErr := findAttachment(partType, partParams, partData, target, seen)
-		if nestedErr != nil || found {
-			return attachment, payload, found, nestedErr
-		}
-	}
+	return raw, newMIMEEntity(raw.Header, body, true), nil
 }
 
 func fromHeaders(path string, header mail.Header) Message {
@@ -260,94 +255,127 @@ const (
 	previewPixelHeight = 24
 )
 
-func extractParts(mediaType string, params map[string]string, data []byte) (textParts, []Attachment, error) {
-	var texts textParts
-	var attachments []Attachment
-	if strings.HasPrefix(mediaType, "multipart/") {
-		boundary := params["boundary"]
-		if boundary == "" {
-			return texts, nil, errors.New("multipart message has no boundary")
+// mimeEntity is the single interpreted representation used while walking a
+// message. Its payload is deliberately traversal-local: Message retains only
+// attachment metadata and bounded image thumbnails.
+type mimeEntity struct {
+	mediaType   string
+	params      map[string]string
+	disposition string
+	filename    string
+	contentID   string
+	data        []byte
+	root        bool
+}
+
+func newMIMEEntity(header mail.Header, data []byte, root bool) mimeEntity {
+	mediaType, params, _ := mime.ParseMediaType(header.Get("Content-Type"))
+	if mediaType == "" {
+		mediaType = "text/plain"
+	}
+	disposition, dispositionParams, _ := mime.ParseMediaType(header.Get("Content-Disposition"))
+	filename := decodeHeader(dispositionParams["filename"])
+	if filename == "" {
+		filename = decodeHeader(params["name"])
+	}
+	return mimeEntity{
+		mediaType: mediaType, params: params, disposition: disposition,
+		filename: filename, contentID: normalizeContentID(header.Get("Content-ID")),
+		data: data, root: root,
+	}
+}
+
+func (entity mimeEntity) attachment() (Attachment, bool) {
+	if entity.root || (entity.disposition != "attachment" && entity.filename == "") {
+		return Attachment{}, false
+	}
+	name := entity.filename
+	if name == "" {
+		name = "unnamed-attachment"
+	}
+	return Attachment{
+		Name: name, MediaType: entity.mediaType, Size: len(entity.data),
+		ContentID: entity.contentID, Inline: entity.disposition == "inline",
+	}, true
+}
+
+type mimeContents struct {
+	texts         textParts
+	attachments   []Attachment
+	targetPayload []byte
+}
+
+type mimeTraversal struct {
+	collectContent bool
+	target         int
+	contents       mimeContents
+}
+
+func traverseMIME(root mimeEntity, collectContent bool, target int) (mimeContents, error) {
+	walk := mimeTraversal{collectContent: collectContent, target: target}
+	err := walk.visit(root)
+	return walk.contents, err
+}
+
+func (walk *mimeTraversal) visit(entity mimeEntity) error {
+	if walk.collectContent && strings.HasPrefix(entity.mediaType, "image/") && len(walk.contents.texts.images) < maxImagePreviews {
+		if preview, ok := makeImagePreview(entity.filename, entity.mediaType, entity.contentID, entity.data); ok {
+			walk.contents.texts.images = append(walk.contents.texts.images, preview)
 		}
-		reader := multipart.NewReader(bytes.NewReader(data), boundary)
+	}
+
+	if attachment, ok := entity.attachment(); ok {
+		index := len(walk.contents.attachments)
+		walk.contents.attachments = append(walk.contents.attachments, attachment)
+		if index == walk.target {
+			walk.contents.targetPayload = entity.data
+		}
+		return nil
+	}
+
+	if strings.HasPrefix(entity.mediaType, "multipart/") {
+		boundary := entity.params["boundary"]
+		if boundary == "" {
+			return errors.New("multipart message has no boundary")
+		}
+		reader := multipart.NewReader(bytes.NewReader(entity.data), boundary)
 		for {
 			part, err := reader.NextPart()
 			if errors.Is(err, io.EOF) {
-				break
+				return nil
 			}
 			if err != nil {
-				return texts, attachments, err
+				return err
 			}
 			partData, err := io.ReadAll(part)
 			if err != nil {
-				return texts, attachments, err
+				return err
 			}
 			partData, err = decodeTransfer(partData, part.Header.Get("Content-Transfer-Encoding"))
 			if err != nil {
-				return texts, attachments, err
+				return err
 			}
-
-			partType, partParams, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
-			if partType == "" {
-				partType = "text/plain"
-			}
-			disposition, dispositionParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-			filename := decodeHeader(dispositionParams["filename"])
-			if filename == "" {
-				filename = decodeHeader(partParams["name"])
-			}
-			contentID := normalizeContentID(part.Header.Get("Content-ID"))
-			previewedImage := false
-			if strings.HasPrefix(partType, "image/") && len(texts.images) < maxImagePreviews {
-				if preview, ok := makeImagePreview(filename, partType, contentID, partData); ok {
-					texts.images = append(texts.images, preview)
-					previewedImage = true
-				}
-			}
-			if disposition == "attachment" || filename != "" {
-				if filename == "" {
-					filename = "unnamed-attachment"
-				}
-				attachments = append(attachments, Attachment{
-					Name: filename, MediaType: partType, Size: len(partData),
-					ContentID: contentID, Inline: disposition == "inline",
-				})
-				continue
-			}
-
-			nested, nestedAttachments, nestedErr := extractParts(partType, partParams, partData)
-			if nestedErr == nil {
-				if texts.plain == "" {
-					texts.plain = nested.plain
-				}
-				if texts.html == "" {
-					texts.html = nested.html
-				}
-				attachments = append(attachments, nestedAttachments...)
-				if !previewedImage {
-					remaining := maxImagePreviews - len(texts.images)
-					if remaining > len(nested.images) {
-						remaining = len(nested.images)
-					}
-					if remaining > 0 {
-						texts.images = append(texts.images, nested.images[:remaining]...)
-					}
-				}
+			// A malformed nested multipart is treated as an unavailable body
+			// alternative. Roll back anything collected from that subtree and
+			// keep inspecting its siblings, matching the reader's fallback
+			// behavior while keeping extraction in the same traversal order.
+			before := walk.contents
+			if err := walk.visit(newMIMEEntity(mail.Header(part.Header), partData, false)); err != nil {
+				walk.contents = before
 			}
 		}
-		return texts, attachments, nil
 	}
-	if mediaType == "text/plain" {
-		texts.plain = string(decodeCharset(data, params["charset"]))
+
+	if !walk.collectContent {
+		return nil
 	}
-	if mediaType == "text/html" {
-		texts.html = string(decodeCharset(data, params["charset"]))
+	if entity.mediaType == "text/plain" && walk.contents.texts.plain == "" {
+		walk.contents.texts.plain = string(decodeCharset(entity.data, entity.params["charset"]))
 	}
-	if strings.HasPrefix(mediaType, "image/") {
-		if preview, ok := makeImagePreview(decodeHeader(params["name"]), mediaType, "", data); ok {
-			texts.images = append(texts.images, preview)
-		}
+	if entity.mediaType == "text/html" && walk.contents.texts.html == "" {
+		walk.contents.texts.html = string(decodeCharset(entity.data, entity.params["charset"]))
 	}
-	return texts, attachments, nil
+	return nil
 }
 
 func decodeTransfer(data []byte, encoding string) ([]byte, error) {

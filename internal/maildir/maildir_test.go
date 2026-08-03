@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"mailtui/internal/message"
 )
 
 func TestDiscoverAndLoad(t *testing.T) {
@@ -31,8 +33,25 @@ func TestDiscoverAndLoad(t *testing.T) {
 	if len(folders[0].Messages) != 1 || folders[0].Messages[0].Subject != "Backup" {
 		t.Fatalf("unexpected messages: %#v", folders[0].Messages)
 	}
-	if folders[0].Messages[0].Loaded || folders[0].Messages[0].Body != "" {
+	if folders[0].Messages[0].LoadState() != message.LoadHeaderOnly || folders[0].Messages[0].Body != "" {
 		t.Fatalf("folder scan hydrated the body: %#v", folders[0].Messages[0])
+	}
+}
+
+func TestInvalidHeaderIsAnExplicitTerminalState(t *testing.T) {
+	root := t.TempDir()
+	makeMaildir(t, root)
+	path := filepath.Join(root, "cur", "invalid")
+	if err := os.WriteFile(path, []byte("not a valid header\r\n\r\nBody"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, err := ScanHeaders(root)
+	if err == nil {
+		t.Fatal("invalid header did not contribute a scan error")
+	}
+	if len(messages) != 1 || messages[0].Path != path || messages[0].LoadState() != message.LoadHeaderInvalid || messages[0].LoadError() == nil || messages[0].NeedsHydration() {
+		t.Fatalf("invalid message = %#v", messages)
 	}
 }
 
