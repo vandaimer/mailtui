@@ -16,17 +16,17 @@ import (
 
 func TestFilterMessagesSearchesHeaders(t *testing.T) {
 	m := testModel()
-	m.query = "alice"
+	m.interaction.query = "alice"
 	matches := m.filteredMessageIndexes()
 	if len(matches) != 1 || matches[0] != 0 {
 		t.Fatalf("matches = %#v", matches)
 	}
-	m.query = "billing@example.com"
+	m.interaction.query = "billing@example.com"
 	matches = m.filteredMessageIndexes()
 	if len(matches) != 1 || matches[0] != 1 {
 		t.Fatalf("recipient matches = %#v", matches)
 	}
-	m.query = "missing"
+	m.interaction.query = "missing"
 	if matches := m.filteredMessageIndexes(); len(matches) != 0 {
 		t.Fatalf("matches = %#v", matches)
 	}
@@ -36,17 +36,17 @@ func TestSearchInteractionCanApplyAndCancel(t *testing.T) {
 	m := testModel()
 	updated, _ := m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
 	m = updated.(Model)
-	if !m.searching || m.focus != messagesPane {
+	if m.interaction.mode != searchMode || m.interaction.focus != messagesPane {
 		t.Fatalf("search not activated: %#v", m)
 	}
 	updated, _ = m.Update(tea.KeyPressMsg{Code: 'a', Text: "alice"})
 	m = updated.(Model)
-	if m.query != "alice" || len(m.filteredMessageIndexes()) != 1 {
-		t.Fatalf("query = %q", m.query)
+	if m.interaction.query != "alice" || len(m.filteredMessageIndexes()) != 1 {
+		t.Fatalf("query = %q", m.interaction.query)
 	}
 	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m = updated.(Model)
-	if m.searching || m.query != "" {
+	if m.interaction.mode != navigationMode || m.interaction.query != "" {
 		t.Fatalf("search was not cancelled: %#v", m)
 	}
 }
@@ -82,7 +82,7 @@ func TestResponsiveViews(t *testing.T) {
 	if !strings.Contains(narrow, "FOLDERS") || strings.Contains(narrow, "READER") {
 		t.Fatalf("unexpected narrow folder view")
 	}
-	m.focus = readerPane
+	m.interaction.focus = readerPane
 	narrow = m.View().Content
 	if !strings.Contains(narrow, "READER") || !strings.Contains(narrow, "Alice's message body") {
 		t.Fatalf("unexpected narrow reader view")
@@ -93,20 +93,22 @@ func TestReaderPagingUsesRenderedViewport(t *testing.T) {
 	for _, size := range [][2]int{{60, 32}, {72, 10}, {90, 32}, {112, 32}} {
 		m := testModel()
 		m.width, m.height = size[0], size[1]
-		m.focus = readerPane
+		m.interaction.focus = readerPane
 		viewportHeight := calculateLayout(m.width, m.height).reader.contentHeight
+		maximum := m.interactionContext().readerMaxScroll
 
 		updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
 		m = updated.(Model)
-		if m.readerScroll != viewportHeight {
-			t.Fatalf("size %dx%d: Page Down moved %d rows, want %d", m.width, m.height, m.readerScroll, viewportHeight)
+		if want := min(viewportHeight, maximum); m.interaction.readerScroll != want {
+			t.Fatalf("size %dx%d: Page Down moved %d rows, want %d", m.width, m.height, m.interaction.readerScroll, want)
 		}
 
-		m.readerScroll = viewportHeight * 2
+		m.interaction.readerScroll = viewportHeight * 2
 		updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
 		m = updated.(Model)
-		if m.readerScroll != viewportHeight {
-			t.Fatalf("size %dx%d: Page Up moved to %d, want %d", m.width, m.height, m.readerScroll, viewportHeight)
+		start := min(viewportHeight*2, maximum)
+		if want := max(0, start-viewportHeight); m.interaction.readerScroll != want {
+			t.Fatalf("size %dx%d: Page Up moved to %d, want %d", m.width, m.height, m.interaction.readerScroll, want)
 		}
 	}
 }
@@ -158,8 +160,8 @@ func TestHeaderAndFooterKeepLayoutChromeToOneLine(t *testing.T) {
 		{
 			name: "pasted search",
 			mutate: func(m *Model) {
-				m.searching = true
-				m.query = "alice\nbilling@example.com"
+				m.interaction.mode = searchMode
+				m.interaction.query = "alice\nbilling@example.com"
 			},
 		},
 		{
@@ -189,17 +191,18 @@ func TestHeaderAndFooterKeepLayoutChromeToOneLine(t *testing.T) {
 
 func TestMessageSelectionUpdatesPreview(t *testing.T) {
 	m := testModel()
-	m.focus = messagesPane
-	m.move(1)
+	m.interaction.focus = messagesPane
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = updated.(Model)
 	selected := m.selectedMessage()
-	if selected == nil || selected.Subject != "Invoice available" || m.readerScroll != 0 {
+	if selected == nil || selected.Subject != "Invoice available" || m.interaction.readerScroll != 0 {
 		t.Fatalf("unexpected selection: %#v", selected)
 	}
 }
 
 func TestRichMessageIsDefaultAndCanToggleToPlainText(t *testing.T) {
 	m := testModel()
-	m.focus = readerPane
+	m.interaction.focus = readerPane
 	m.folders[0].Messages[0].Path = "/mail/INBOX/cur/1"
 	m.folders[0].Messages[0].Body = "Unique plain fallback"
 	m.folders[0].Messages[0].RichBody = "# Rich heading\n\nA **formatted** message."
@@ -321,8 +324,9 @@ func TestInvalidHeaderIsTerminalAndRenderedSeparately(t *testing.T) {
 
 func TestFolderNavigationIsDebounced(t *testing.T) {
 	m := Model{folders: []maildir.Folder{{Path: "/network/INBOX"}, {Path: "/network/Other"}}, reads: &stubReader{}}
-	cmd := m.move(1)
-	if cmd == nil || m.folderIndex != 1 || m.folders[1].Messages != nil {
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = updated.(Model)
+	if cmd == nil || m.interaction.folderCursor != 1 || m.folders[1].Messages != nil {
 		t.Fatalf("folder navigation blocked or eagerly loaded: %#v", m)
 	}
 }
@@ -333,7 +337,7 @@ func TestRefreshKeyForcesSelectedFolderReload(t *testing.T) {
 
 	updated, cmd := m.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	m = updated.(Model)
-	if cmd == nil || m.refreshingFolder != "/network/INBOX" || m.messageIndex != 0 {
+	if cmd == nil || m.refreshingFolder != "/network/INBOX" || m.interaction.messageCursor != 0 {
 		t.Fatalf("refresh was not scheduled: %#v", m)
 	}
 	due, ok := cmd().(folderReadDue)
@@ -421,13 +425,105 @@ func TestAttachmentPickerIsDiscoverable(t *testing.T) {
 	m.folders[0].Messages[0].Attachments = []message.Attachment{{Name: "invoice.pdf", MediaType: "application/pdf", Size: 4096}}
 	updated, _ := m.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
 	m = updated.(Model)
-	if !m.attachmentPicker || !strings.Contains(m.View().Content, "invoice.pdf") {
+	if m.interaction.mode != attachmentsMode || !strings.Contains(m.View().Content, "invoice.pdf") {
 		t.Fatalf("attachment picker did not open: %#v", m)
 	}
 	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = updated.(Model)
-	if cmd == nil || m.attachmentPicker || !m.openingAttachment {
+	if cmd == nil || m.interaction.mode != navigationMode || !m.openingAttachment {
 		t.Fatalf("attachment open was not scheduled: %#v", m)
+	}
+}
+
+func TestAsyncFolderReplacementReconcilesAttachmentPicker(t *testing.T) {
+	m := testModel()
+	m.folders[0].Path = "/mail/INBOX"
+	m.folders[0].Messages[0].Path = "/mail/INBOX/cur/1"
+	m.folders[0].Messages[0].Attachments = []message.Attachment{{Name: "invoice.pdf", MediaType: "application/pdf"}}
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
+	m = updated.(Model)
+	m.interaction.readerScroll = 8
+
+	request := (&stubReader{}).RequestFolder("/mail/INBOX", true)
+	replacement := []message.Message{{Path: "/mail/INBOX/cur/2", Subject: "Replacement"}}
+	updated, _ = m.Update(readsession.FolderUpdate{Request: request, Messages: replacement})
+	m = updated.(Model)
+	if m.interaction.mode != navigationMode || m.interaction.attachmentCursor != 0 || m.interaction.messageCursor != 0 || m.interaction.readerScroll != 0 {
+		t.Fatalf("folder replacement left stale interaction state: %#v", m.interaction)
+	}
+}
+
+func TestProgressiveReplacementPreservesSelectedMessagePath(t *testing.T) {
+	messageA := (message.Message{Path: "/mail/cur/a", Subject: "A"}).MarkContentReady()
+	messageB := (message.Message{Path: "/mail/cur/b", Subject: "B"}).MarkContentReady()
+	newer := (message.Message{Path: "/mail/cur/new", Subject: "New"}).MarkContentReady()
+	m := Model{
+		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{messageA, messageB}}},
+		width:   130, height: 32, reads: &stubReader{},
+	}
+	m.interaction.messageCursor = 1
+	m.reconcileInteraction()
+	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path {
+		t.Fatalf("initial selection = %#v", selected)
+	}
+
+	m.replaceFolderMessages("/mail", []message.Message{newer, messageA, messageB})
+	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path || m.interaction.messageCursor != 2 {
+		t.Fatalf("replacement moved selection: selected=%#v interaction=%#v", selected, m.interaction)
+	}
+}
+
+func TestSearchCancelPreservesSelectedPathAcrossReplacement(t *testing.T) {
+	messageA := (message.Message{Path: "/mail/cur/a", Subject: "Alpha"}).MarkContentReady()
+	messageB := (message.Message{Path: "/mail/cur/b", Subject: "Beta"}).MarkContentReady()
+	newer := (message.Message{Path: "/mail/cur/new", Subject: "Newest"}).MarkContentReady()
+	m := Model{
+		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{messageA, messageB}}},
+		width:   130, height: 32, reads: &stubReader{}, documentCache: make(map[readerDocumentKey][]string),
+	}
+	m.interaction.focus = readerPane
+	m.interaction.messageCursor = 1
+	m.reconcileInteraction()
+	updated, _ := m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyPressMsg{Code: 'b', Text: "b"})
+	m = updated.(Model)
+	m.replaceFolderMessages("/mail", []message.Message{newer, messageA, messageB})
+	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	m = updated.(Model)
+	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path || m.interaction.messageCursor != 2 {
+		t.Fatalf("search cancel moved selection after replacement: selected=%#v interaction=%#v", selected, m.interaction)
+	}
+}
+
+func TestHiddenReaderInteractionDoesNotBuildDocumentCache(t *testing.T) {
+	m := testModel()
+	m.width = 60
+	m.interaction.focus = foldersPane
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = updated.(Model)
+	if m.interaction.focus != messagesPane || len(m.documentCache) != 0 {
+		t.Fatalf("hidden reader built a document: focus=%v cache=%d", m.interaction.focus, len(m.documentCache))
+	}
+}
+
+func TestSamePathHydrationInvalidatesReaderDocument(t *testing.T) {
+	path := "/mail/cur/1"
+	oldMessage := (message.Message{Path: path, Subject: "Subject", Body: "old body"}).MarkContentReady()
+	m := Model{
+		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{oldMessage}}},
+		width:   130, height: 32, reads: &stubReader{}, documentCache: make(map[readerDocumentKey][]string),
+	}
+	if view := m.View().Content; !strings.Contains(view, "old body") {
+		t.Fatalf("old body was not rendered:\n%s", view)
+	}
+	newMessage := (message.Message{Path: path, Subject: "Subject", Body: "new body\nwith another line"}).MarkContentReady()
+	request := (&stubReader{}).RequestMessage(message.Message{Path: path})
+	updated, _ := m.Update(readsession.MessageUpdate{Request: request, Message: newMessage})
+	m = updated.(Model)
+	view := m.View().Content
+	if !strings.Contains(view, "new body") || strings.Contains(view, "old body") {
+		t.Fatalf("same-path hydration reused stale document:\n%s", view)
 	}
 }
 
@@ -439,7 +535,10 @@ func testModel() Model {
 			(message.Message{From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local)}).MarkContentReady(),
 		},
 	}}
-	return Model{root: "/backup/mail", folders: folders, width: 130, height: 32, reads: &stubReader{}}
+	return Model{
+		root: "/backup/mail", folders: folders, width: 130, height: 32, reads: &stubReader{},
+		documentCache: make(map[readerDocumentKey][]string),
+	}
 }
 
 type stubReader struct{ next readsession.RequestID }

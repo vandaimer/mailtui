@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -15,14 +14,6 @@ import (
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
 	"mailtui/internal/readsession"
-)
-
-type pane int
-
-const (
-	foldersPane pane = iota
-	messagesPane
-	readerPane
 )
 
 const (
@@ -49,38 +40,33 @@ var (
 )
 
 type Model struct {
-	root                      string
-	folders                   []maildir.Folder
-	focus                     pane
-	folderIndex, messageIndex int
-	readerScroll              int
-	width, height             int
-	status                    string
-	searching                 bool
-	query, queryBeforeSearch  string
-	loadingFolder             string
-	refreshingFolder          string
-	loadingMessage            string
-	spinnerFrame              int
-	reads                     readsession.Reader
-	attachmentPicker          bool
-	attachmentIndex           int
-	openingAttachment         bool
-	plainBody                 bool
-	bodyRenderCache           map[bodyRenderKey][]string
+	root              string
+	folders           []maildir.Folder
+	interaction       interactionState
+	width, height     int
+	status            string
+	loadingFolder     string
+	refreshingFolder  string
+	loadingMessage    string
+	spinnerFrame      int
+	reads             readsession.Reader
+	openingAttachment bool
+	documentCache     map[readerDocumentKey][]string
 }
 
-type bodyRenderKey struct {
+type readerDocumentKey struct {
 	path  string
 	width int
 	plain bool
 }
 
 func New(root string, folders []maildir.Folder) Model {
-	return Model{
-		root: root, folders: folders, focus: foldersPane, reads: readsession.New(root),
-		bodyRenderCache: make(map[bodyRenderKey][]string),
+	model := Model{
+		root: root, folders: folders, reads: readsession.New(root),
+		documentCache: make(map[readerDocumentKey][]string),
 	}
+	model.reconcileInteraction()
+	return model
 }
 
 type attachmentOpened struct {
@@ -102,9 +88,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
 	case tea.WindowSizeMsg:
 		if m.width != value.Width {
-			m.bodyRenderCache = make(map[bodyRenderKey][]string)
+			m.documentCache = make(map[readerDocumentKey][]string)
 		}
 		m.width, m.height = value.Width, value.Height
+		m.reconcileInteraction()
 	case folderReadDue:
 		if value.path != m.selectedFolderPath() || (!value.refresh && m.selectedFolderLoaded()) || m.loadingFolder == value.path {
 			return m, nil
@@ -199,228 +186,73 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, spinnerCmd()
 		}
 	case tea.KeyPressMsg:
-		if m.attachmentPicker {
-			return m.updateAttachmentPicker(value)
-		}
-		if m.searching {
-			return m.updateSearch(value)
-		}
-		return m.updateNavigation(value)
+		return m.updateInteraction(value)
 	}
 	return m, nil
 }
 
-func (m Model) updateAttachmentPicker(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	selected := m.selectedMessage()
-	if selected == nil || len(selected.Attachments) == 0 {
-		m.attachmentPicker = false
-		return m, nil
-	}
-	switch key.String() {
-	case "ctrl+c":
-		return m, tea.Quit
-	case "esc", "q", "o":
-		m.attachmentPicker = false
-	case "up", "k":
-		m.attachmentIndex = clamp(m.attachmentIndex-1, 0, len(selected.Attachments)-1)
-	case "down", "j":
-		m.attachmentIndex = clamp(m.attachmentIndex+1, 0, len(selected.Attachments)-1)
-	case "enter":
-		m.attachmentPicker = false
-		m.openingAttachment = true
-		return m, tea.Batch(openAttachmentCmd(selected.Path, m.attachmentIndex), spinnerCmd())
-	}
-	return m, nil
+func (m Model) updateInteraction(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	context := m.reconcileInteraction()
+	outcome := m.interaction.Apply(interactionInput{key: key.String(), text: key.Text}, context)
+	m.reconcileInteraction()
+	return m.finishInteraction(outcome)
 }
 
-func (m Model) updateSearch(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch key.String() {
-	case "ctrl+c":
+func (m Model) finishInteraction(outcome interactionOutcome) (tea.Model, tea.Cmd) {
+	if outcome.quit {
 		return m, tea.Quit
-	case "esc":
-		m.query = m.queryBeforeSearch
-		m.searching = false
-		m.messageIndex = 0
-		m.readerScroll = 0
-	case "enter":
-		m.searching = false
-	case "backspace":
-		if len(m.query) > 0 {
-			_, size := utf8.DecodeLastRuneInString(m.query)
-			m.query = m.query[:len(m.query)-size]
-			m.messageIndex = 0
-			m.readerScroll = 0
-		}
-	case "ctrl+u":
-		m.query = ""
-		m.messageIndex = 0
-		m.readerScroll = 0
-	default:
-		if key.Text != "" {
-			m.query += key.Text
-			m.messageIndex = 0
-			m.readerScroll = 0
+	}
+	switch outcome.notice {
+	case noAttachmentsNotice:
+		m.status = "The selected message has no attachments"
+	case noRichBodyNotice:
+		m.status = "This message has no rich HTML view"
+	case plainBodyNotice:
+		m.status = "Plain-text view"
+	case richBodyNotice:
+		m.status = "Rich HTML view"
+	case noFolderNotice:
+		m.status = "No folder selected"
+	case folderBusyNotice:
+		m.status = "Wait for the current folder read to finish"
+	}
+	if outcome.openAttachment {
+		selected := m.selectedMessage()
+		if selected != nil {
+			m.openingAttachment = true
+			return m, tea.Batch(openAttachmentCmd(selected.Path, outcome.attachmentIndex), spinnerCmd())
 		}
 	}
-	return m, m.queueSelectedMessage(messageDebounce)
-}
-
-func (m Model) updateNavigation(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-	switch key.String() {
-	case "ctrl+c", "q":
-		return m, tea.Quit
-	case "/":
-		m.searching = true
-		m.queryBeforeSearch = m.query
-		if m.focus == foldersPane {
-			m.focus = messagesPane
-		}
-	case "o":
-		selected := m.selectedMessage()
-		if selected != nil && selected.LoadState() == message.LoadContentReady && len(selected.Attachments) > 0 {
-			m.attachmentPicker = true
-			m.attachmentIndex = 0
-			m.focus = readerPane
-		} else {
-			m.status = "The selected message has no attachments"
-		}
-	case "v":
-		selected := m.selectedMessage()
-		if selected == nil || selected.LoadState() != message.LoadContentReady || strings.TrimSpace(selected.RichBody) == "" {
-			m.status = "This message has no rich HTML view"
-			break
-		}
-		m.plainBody = !m.plainBody
-		m.readerScroll = 0
-		if m.plainBody {
-			m.status = "Plain-text view"
-		} else {
-			m.status = "Rich HTML view"
-		}
-	case "r":
+	if outcome.refreshFolder {
 		path := m.selectedFolderPath()
-		if path == "" {
-			m.status = "No folder selected"
-			break
-		}
-		if m.loadingFolder != "" {
-			m.status = "Wait for the current folder read to finish"
-			break
-		}
 		m.refreshingFolder = path
 		m.status = "Refreshing the selected folder"
-		m.messageIndex = 0
-		m.readerScroll = 0
-		cmd = refreshFolderCmd(path)
-	case "tab":
-		m.focus = (m.focus + 1) % 3
-		cmd = m.ensureFocusedData()
-	case "shift+tab":
-		m.focus = (m.focus + 2) % 3
-		cmd = m.ensureFocusedData()
-	case "left", "h":
-		if m.focus > foldersPane {
-			m.focus--
-		}
-	case "right", "l":
-		if m.focus < readerPane {
-			m.focus++
-			cmd = m.ensureFocusedData()
-		}
-	case "esc", "backspace":
-		if m.query != "" {
-			m.query = ""
-			m.messageIndex = 0
-		} else if m.focus > foldersPane {
-			m.focus--
-		}
-	case "enter":
-		if m.focus < readerPane {
-			m.focus++
-			cmd = m.ensureFocusedData()
-		}
-	case "up", "k":
-		cmd = m.move(-1)
-	case "down", "j":
-		cmd = m.move(1)
-	case "pgup":
-		if m.focus == readerPane {
-			viewportHeight := calculateLayout(m.width, m.height).reader.contentHeight
-			m.readerScroll = max(0, m.readerScroll-max(1, viewportHeight))
-		}
-	case "pgdown":
-		if m.focus == readerPane {
-			viewportHeight := calculateLayout(m.width, m.height).reader.contentHeight
-			m.readerScroll += max(1, viewportHeight)
-		}
-	case "home":
-		cmd = m.moveToBoundary(false)
-	case "end":
-		cmd = m.moveToBoundary(true)
+		return m, refreshFolderCmd(path)
 	}
-	return m, cmd
-}
-
-func (m *Model) move(delta int) tea.Cmd {
-	switch m.focus {
-	case foldersPane:
-		if len(m.folders) == 0 {
-			return nil
+	if outcome.folderRead == readImmediately && outcome.messageRead == readImmediately {
+		if !m.selectedFolderLoaded() {
+			return m, m.queueSelectedFolder(0)
 		}
-		next := clamp(m.folderIndex+delta, 0, len(m.folders)-1)
-		if next != m.folderIndex {
-			m.folderIndex = next
-			m.messageIndex = 0
-			m.readerScroll = 0
-			m.query = ""
-			return m.queueSelectedFolder(folderDebounce)
+		if m.interaction.focus >= messagesPane {
+			return m, m.queueSelectedMessage(0)
 		}
-	case messagesPane:
-		matches := m.filteredMessageIndexes()
-		if len(matches) > 0 {
-			m.messageIndex = clamp(m.messageIndex+delta, 0, len(matches)-1)
-			m.readerScroll = 0
-			return m.queueSelectedMessage(messageDebounce)
+		return m, nil
+	}
+	if outcome.folderRead != noRead {
+		delay := time.Duration(0)
+		if outcome.folderRead == readDeferred {
+			delay = folderDebounce
 		}
-	case readerPane:
-		m.readerScroll = max(0, m.readerScroll+delta)
+		return m, m.queueSelectedFolder(delay)
 	}
-	return nil
-}
-
-func (m *Model) moveToBoundary(end bool) tea.Cmd {
-	if m.focus == foldersPane && len(m.folders) > 0 {
-		if end {
-			m.folderIndex = len(m.folders) - 1
-		} else {
-			m.folderIndex = 0
+	if outcome.messageRead != noRead {
+		delay := time.Duration(0)
+		if outcome.messageRead == readDeferred {
+			delay = messageDebounce
 		}
-		m.messageIndex, m.readerScroll = 0, 0
-		m.query = ""
-		return m.queueSelectedFolder(folderDebounce)
+		return m, m.queueSelectedMessage(delay)
 	}
-	if m.focus == messagesPane {
-		matches := m.filteredMessageIndexes()
-		if end && len(matches) > 0 {
-			m.messageIndex = len(matches) - 1
-		} else {
-			m.messageIndex = 0
-		}
-		m.readerScroll = 0
-		return m.queueSelectedMessage(messageDebounce)
-	}
-	return nil
-}
-
-func (m Model) ensureFocusedData() tea.Cmd {
-	if !m.selectedFolderLoaded() {
-		return m.queueSelectedFolder(0)
-	}
-	if m.focus >= messagesPane {
-		return m.queueSelectedMessage(0)
-	}
-	return nil
+	return m, nil
 }
 
 func (m Model) queueSelectedFolder(delay time.Duration) tea.Cmd {
@@ -505,12 +337,14 @@ func (m *Model) replaceFolderMessages(path string, messages []message.Message) {
 	for index := range m.folders {
 		if m.folders[index].Path == path {
 			m.folders[index].Messages = messages
+			m.reconcileInteraction()
 			return
 		}
 	}
 }
 
 func (m *Model) storeMessageResult(result readsession.MessageUpdate) {
+	m.invalidateDocument(result.Request.Path)
 	for folderIndex := range m.folders {
 		for messageIndex := range m.folders[folderIndex].Messages {
 			if m.folders[folderIndex].Messages[messageIndex].Path != result.Request.Path {
@@ -526,25 +360,30 @@ func (m *Model) storeMessageResult(result readsession.MessageUpdate) {
 	if m.loadingMessage == result.Request.Path {
 		m.loadingMessage = ""
 	}
+	m.reconcileInteraction()
 }
 
 func (m Model) selectedFolderPath() string {
 	if len(m.folders) == 0 {
 		return ""
 	}
-	return m.folders[m.folderIndex].Path
+	return m.folders[clampCursor(m.interaction.folderCursor, len(m.folders))].Path
 }
 
 func (m Model) selectedFolderLoaded() bool {
-	return len(m.folders) > 0 && m.folders[m.folderIndex].Messages != nil
+	return len(m.folders) > 0 && m.folders[clampCursor(m.interaction.folderCursor, len(m.folders))].Messages != nil
 }
 
 func (m Model) filteredMessageIndexes() []int {
-	if len(m.folders) == 0 || m.folders[m.folderIndex].Messages == nil {
+	if len(m.folders) == 0 {
 		return nil
 	}
-	messages := m.folders[m.folderIndex].Messages
-	query := strings.ToLower(strings.TrimSpace(m.query))
+	folderIndex := clampCursor(m.interaction.folderCursor, len(m.folders))
+	if m.folders[folderIndex].Messages == nil {
+		return nil
+	}
+	messages := m.folders[folderIndex].Messages
+	query := strings.ToLower(strings.TrimSpace(m.interaction.query))
 	indexes := make([]int, 0, len(messages))
 	for index, item := range messages {
 		if query == "" || strings.Contains(strings.ToLower(strings.Join([]string{
@@ -564,8 +403,73 @@ func (m Model) selectedMessage() *message.Message {
 	if len(matches) == 0 {
 		return nil
 	}
-	selected := clamp(m.messageIndex, 0, len(matches)-1)
-	return &m.folders[m.folderIndex].Messages[matches[selected]]
+	selected := clamp(m.interaction.messageCursor, 0, len(matches)-1)
+	folderIndex := clampCursor(m.interaction.folderCursor, len(m.folders))
+	return &m.folders[folderIndex].Messages[matches[selected]]
+}
+
+func (m *Model) reconcileInteraction() interactionContext {
+	for range 2 {
+		context := m.interactionContext()
+		if !m.interaction.Reconcile(context) {
+			return context
+		}
+	}
+	context := m.interactionContext()
+	m.interaction.Reconcile(context)
+	return context
+}
+
+func (m Model) interactionContext() interactionContext {
+	matches := m.filteredMessageIndexes()
+	context := interactionContext{
+		folderCount:    len(m.folders),
+		messageCount:   len(matches),
+		preservedIndex: -1,
+		hasFolder:      len(m.folders) > 0,
+		folderLoading:  m.loadingFolder != "",
+	}
+	var selected *message.Message
+	if len(m.folders) > 0 && len(matches) > 0 {
+		folderIndex := clampCursor(m.interaction.folderCursor, len(m.folders))
+		cursor := clampCursor(m.interaction.messageCursor, len(matches))
+		selected = &m.folders[folderIndex].Messages[matches[cursor]]
+		for position, messageIndex := range matches {
+			if m.folders[folderIndex].Messages[messageIndex].Path == m.interaction.selectedKey {
+				context.preservedIndex = position
+				context.preserveSelection = true
+				break
+			}
+		}
+	}
+	if selected != nil {
+		context.selectedKey = selected.Path
+		context.canPickAttachments = selected.LoadState() == message.LoadContentReady && len(selected.Attachments) > 0
+		context.attachmentCount = len(selected.Attachments)
+		context.hasRichBody = selected.LoadState() == message.LoadContentReady && strings.TrimSpace(selected.RichBody) != ""
+	}
+	layout := calculateLayout(m.width, m.height)
+	if layout.usable && m.interaction.mode == navigationMode && m.interaction.focus == readerPane {
+		context.readerBoundsValid = true
+		context.readerPageRows = max(1, layout.reader.contentHeight)
+		context.readerMaxScroll = m.readerMaxScroll(layout.reader, selected)
+	}
+	return context
+}
+
+func (m Model) readerMaxScroll(geometry paneGeometry, selected *message.Message) int {
+	if selected == nil || selected.LoadState() != message.LoadContentReady {
+		return 0
+	}
+	return max(0, len(m.readerDocumentLines(selected, geometry.contentWidth))-geometry.contentHeight)
+}
+
+func (m *Model) invalidateDocument(path string) {
+	for key := range m.documentCache {
+		if key.path == path {
+			delete(m.documentCache, key)
+		}
+	}
 }
 
 func (m Model) View() tea.View {
@@ -599,15 +503,15 @@ func (m Model) headerView() string {
 }
 
 func (m Model) footerView() string {
-	if m.attachmentPicker {
+	if m.interaction.mode == attachmentsMode {
 		return fitSides(accentStyle.Render("ATTACHMENTS  ↑↓ select  Enter open  Esc cancel"), mutedStyle.Render("read only"), m.width)
 	}
-	if m.searching {
+	if m.interaction.mode == searchMode {
 		count := len(m.filteredMessageIndexes())
 		prefix := accentStyle.Render(" / ")
 		right := mutedStyle.Render(fmt.Sprintf("%d result(s)  Enter apply  Esc cancel", count))
 		queryWidth := max(1, m.width-lipgloss.Width(prefix)-lipgloss.Width(right)-1)
-		left := prefix + lipgloss.NewStyle().Foreground(textColor).Render(truncate(singleLine(m.query)+"█", queryWidth))
+		left := prefix + lipgloss.NewStyle().Foreground(textColor).Render(truncate(singleLine(m.interaction.query)+"█", queryWidth))
 		return fitSides(left, right, m.width)
 	}
 	left := softStyle.Render("Tab/←→ focus  ↑↓ navigate  / search  r refresh  v view  o attachments  Esc back")
@@ -646,7 +550,7 @@ func (m Model) bodyView(layout layoutPlan) string {
 			),
 		)
 	default:
-		switch m.focus {
+		switch m.interaction.focus {
 		case foldersPane:
 			return m.folderPane(layout.folders)
 		case messagesPane:
@@ -668,7 +572,7 @@ func (m Model) folderPane(geometry paneGeometry) string {
 			count = " " + m.spinner()
 		}
 		line := fitSides(truncate(name, max(1, geometry.width-8)), mutedStyle.Render(count), geometry.contentWidth)
-		if index == m.folderIndex {
+		if index == m.interaction.folderCursor {
 			line = fillStyle(selectedStyle, "› "+line, geometry.contentWidth)
 		} else {
 			line = "  " + line
@@ -678,31 +582,31 @@ func (m Model) folderPane(geometry paneGeometry) string {
 	if len(lines) == 0 {
 		lines = []string{mutedStyle.Render("No folders found")}
 	}
-	lines = window(lines, m.folderIndex, geometry.contentHeight)
-	return paneBox("FOLDERS", fmt.Sprintf("%d", len(m.folders)), lines, geometry, m.focus == foldersPane)
+	lines = window(lines, m.interaction.folderCursor, geometry.contentHeight)
+	return paneBox("FOLDERS", fmt.Sprintf("%d", len(m.folders)), lines, geometry, m.interaction.focus == foldersPane)
 }
 
 func (m Model) messagesPane(geometry paneGeometry) string {
 	if !m.selectedFolderLoaded() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Loading messages"), mutedStyle.Render("Reading Maildir headers only…")}
-		return paneBox("MESSAGES", "", lines, geometry, m.focus == messagesPane)
+		return paneBox("MESSAGES", "", lines, geometry, m.interaction.focus == messagesPane)
 	}
 	matches := m.filteredMessageIndexes()
 	rowsPerMessage := 3
 	visibleCount := max(1, geometry.contentHeight/rowsPerMessage)
-	selected := clamp(m.messageIndex, 0, max(0, len(matches)-1))
+	selected := clamp(m.interaction.messageCursor, 0, max(0, len(matches)-1))
 	start := clamp(selected-visibleCount/2, 0, max(0, len(matches)-visibleCount))
 	end := min(len(matches), start+visibleCount)
 	var lines []string
 	if len(matches) == 0 {
-		if m.query != "" {
+		if m.interaction.query != "" {
 			lines = []string{"", accentStyle.Render("No results"), mutedStyle.Render("Try another search term.")}
 		} else {
 			lines = []string{"", mutedStyle.Render("This folder is empty.")}
 		}
 	} else {
 		for position := start; position < end; position++ {
-			item := m.folders[m.folderIndex].Messages[matches[position]]
+			item := m.folders[m.interaction.folderCursor].Messages[matches[position]]
 			available := geometry.contentWidth
 			first := fitSides(truncate(displaySender(item.From), max(4, available-10)), displayDate(item.Date), available)
 			second := truncate(empty(item.Subject, "(no subject)"), available)
@@ -729,30 +633,30 @@ func (m Model) messagesPane(geometry paneGeometry) string {
 	}
 	folderName := "MESSAGES"
 	if len(m.folders) > 0 {
-		folderName = truncate(strings.ToUpper(maildir.DisplayName(m.folders[m.folderIndex].Name)), 22)
+		folderName = truncate(strings.ToUpper(maildir.DisplayName(m.folders[m.interaction.folderCursor].Name)), 22)
 	}
 	count := fmt.Sprintf("%d/%d", len(matches), m.folderMessageCount())
-	return paneBox(folderName, count, lines, geometry, m.focus == messagesPane)
+	return paneBox(folderName, count, lines, geometry, m.interaction.focus == messagesPane)
 }
 
 func (m Model) readerPane(geometry paneGeometry) string {
 	if !m.selectedFolderLoaded() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Preparing folder"), mutedStyle.Render("The interface remains responsive while loading.")}
-		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
 	}
 	if m.loadingFolder != "" && m.loadingFolder == m.selectedFolderPath() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Receiving message batches"), mutedStyle.Render(fmt.Sprintf("%d headers available so far…", m.folderMessageCount()))}
-		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
 	}
 	item := m.selectedMessage()
 	available := geometry.contentWidth
 	if item == nil {
 		lines := []string{"", accentStyle.Render("No message selected"), mutedStyle.Render("Choose a message or adjust your search.")}
-		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
 	}
 	if item.LoadState() == message.LoadHeaderInvalid {
 		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Invalid message"), mutedStyle.Render(truncate(item.LoadError().Error(), available))}
-		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
 	}
 	if item.LoadState() == message.LoadContentUnavailable {
 		lines := []string{
@@ -760,7 +664,7 @@ func (m Model) readerPane(geometry paneGeometry) string {
 			lipgloss.NewStyle().Foreground(warning).Render("Could not load message content"),
 			mutedStyle.Render(truncate(item.LoadError().Error(), available)),
 		}
-		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
 	}
 	if item.LoadState() == message.LoadHeaderOnly {
 		lines := []string{
@@ -769,55 +673,55 @@ func (m Model) readerPane(geometry paneGeometry) string {
 		lines = append(lines, labelValue("From", item.From, available)...)
 		lines = append(lines, labelValue("To", item.To, available)...)
 		lines = append(lines, "", accentStyle.Render(m.spinner()+" Loading content…"), mutedStyle.Render("Only this file will be read in full."))
-		return paneBox("READER", "", lines, geometry, m.focus == readerPane)
+		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
 	}
-	if m.attachmentPicker {
+	if m.interaction.mode == attachmentsMode {
 		return m.attachmentPickerPane(item, geometry)
 	}
 
-	var lines []string
-	lines = append(lines, titleStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)))
-	lines = append(lines, labelValue("From", item.From, available)...)
-	lines = append(lines, labelValue("To", item.To, available)...)
-	if item.Cc != "" {
-		lines = append(lines, labelValue("Cc", item.Cc, available)...)
-	}
-	if item.Bcc != "" {
-		lines = append(lines, labelValue("Bcc", item.Bcc, available)...)
-	}
-	lines = append(lines, labelValue("Date", item.DateText, available)...)
-	if len(item.Attachments) > 0 {
-		lines = append(lines, "", accentStyle.Render(fmt.Sprintf("▣ %d attachment(s)", len(item.Attachments))))
-		for _, attachment := range item.Attachments {
-			lines = append(lines, truncate(fmt.Sprintf("  %s · %s · %s", attachment.Name, attachment.MediaType, formatBytes(attachment.Size)), available))
-		}
-	}
-	lines = append(lines, "", mutedStyle.Render(strings.Repeat("─", available)), "")
-	lines = append(lines, m.renderedMessageContent(item, available)...)
+	lines := m.readerDocumentLines(item, available)
 
 	maxScroll := max(0, len(lines)-geometry.contentHeight)
-	scroll := clamp(m.readerScroll, 0, maxScroll)
+	scroll := clamp(m.interaction.readerScroll, 0, maxScroll)
 	end := min(len(lines), scroll+geometry.contentHeight)
 	indicator := "PLAIN"
-	if !m.plainBody && strings.TrimSpace(item.RichBody) != "" {
+	if !m.interaction.preferPlain && strings.TrimSpace(item.RichBody) != "" {
 		indicator = "RICH"
 	}
 	if maxScroll > 0 {
 		indicator += fmt.Sprintf(" · %d%%", scroll*100/max(1, maxScroll))
 	}
-	return paneBox("READER", indicator, lines[scroll:end], geometry, m.focus == readerPane)
+	return paneBox("READER", indicator, lines[scroll:end], geometry, m.interaction.focus == readerPane)
 }
 
-func (m Model) renderedMessageContent(item *message.Message, width int) []string {
-	key := bodyRenderKey{path: item.Path, width: width, plain: m.plainBody}
-	if item.Path != "" && m.bodyRenderCache != nil {
-		if cached, found := m.bodyRenderCache[key]; found {
+func (m Model) readerDocumentLines(item *message.Message, width int) []string {
+	key := readerDocumentKey{path: item.Path, width: width, plain: m.interaction.preferPlain}
+	if item.Path != "" && m.documentCache != nil {
+		if cached, found := m.documentCache[key]; found {
 			return cached
 		}
 	}
-	lines := renderMessageContent(item, width, m.plainBody)
-	if item.Path != "" && m.bodyRenderCache != nil {
-		m.bodyRenderCache[key] = lines
+	var lines []string
+	lines = append(lines, titleStyle.Render(truncate(empty(item.Subject, "(no subject)"), width)))
+	lines = append(lines, labelValue("From", item.From, width)...)
+	lines = append(lines, labelValue("To", item.To, width)...)
+	if item.Cc != "" {
+		lines = append(lines, labelValue("Cc", item.Cc, width)...)
+	}
+	if item.Bcc != "" {
+		lines = append(lines, labelValue("Bcc", item.Bcc, width)...)
+	}
+	lines = append(lines, labelValue("Date", item.DateText, width)...)
+	if len(item.Attachments) > 0 {
+		lines = append(lines, "", accentStyle.Render(fmt.Sprintf("▣ %d attachment(s)", len(item.Attachments))))
+		for _, attachment := range item.Attachments {
+			lines = append(lines, truncate(fmt.Sprintf("  %s · %s · %s", attachment.Name, attachment.MediaType, formatBytes(attachment.Size)), width))
+		}
+	}
+	lines = append(lines, "", mutedStyle.Render(strings.Repeat("─", width)), "")
+	lines = append(lines, renderMessageContent(item, width, m.interaction.preferPlain)...)
+	if item.Path != "" && m.documentCache != nil {
+		m.documentCache[key] = lines
 	}
 	return lines
 }
@@ -827,14 +731,14 @@ func (m Model) attachmentPickerPane(item *message.Message, geometry paneGeometry
 	lines := []string{mutedStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)), ""}
 	for index, entry := range item.Attachments {
 		line := fitSides(truncate(entry.Name, max(4, available-12)), formatBytes(entry.Size), available)
-		if index == m.attachmentIndex {
+		if index == m.interaction.attachmentCursor {
 			line = fillStyle(selectedStyle, "› "+line, available)
 		} else {
 			line = "  " + line
 		}
 		lines = append(lines, line, mutedStyle.Render("  "+truncate(entry.MediaType, available-2)))
 	}
-	lines = window(lines, m.attachmentIndex*2+2, geometry.contentHeight)
+	lines = window(lines, m.interaction.attachmentCursor*2+2, geometry.contentHeight)
 	return paneBox("ATTACHMENTS", fmt.Sprintf("%d", len(item.Attachments)), lines, geometry, true)
 }
 
@@ -864,10 +768,10 @@ func paneBox(title, meta string, lines []string, geometry paneGeometry, focused 
 }
 
 func (m Model) folderMessageCount() int {
-	if len(m.folders) == 0 || m.folders[m.folderIndex].Messages == nil {
+	if len(m.folders) == 0 || m.folders[m.interaction.folderCursor].Messages == nil {
 		return 0
 	}
-	return len(m.folders[m.folderIndex].Messages)
+	return len(m.folders[m.interaction.folderCursor].Messages)
 }
 
 func (m Model) spinner() string {
