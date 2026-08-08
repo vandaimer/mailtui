@@ -3,6 +3,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"mailtui/internal/attachment"
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
 	"mailtui/internal/readsession"
@@ -56,7 +58,9 @@ func TestSearchCancelRestoresPathFilteredOutByDraft(t *testing.T) {
 	m := testModel()
 	m.interaction.focus = readerPane
 	m.interaction.selectedPath = "/mail/cur/bank"
-	m.folders[0].Messages[1].Body = strings.Repeat("reader line\n", 80)
+	mutateFolderMessages(&m, 0, func(messages []message.Message) {
+		messages[1].Body = strings.Repeat("reader line\n", 80)
+	})
 	m.interaction.readerScroll = 7
 
 	updated, _ := m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
@@ -226,9 +230,11 @@ func TestMessageSelectionUpdatesPreview(t *testing.T) {
 func TestMessageNavigationWithPathsIsNotUndoneByReconciliation(t *testing.T) {
 	m := testModel()
 	m.interaction.focus = messagesPane
-	for index := range m.folders[0].Messages {
-		m.folders[0].Messages[index].Path = fmt.Sprintf("/mail/INBOX/cur/%d", index)
-	}
+	mutateFolderMessages(&m, 0, func(messages []message.Message) {
+		for index := range messages {
+			messages[index].Path = fmt.Sprintf("/mail/INBOX/cur/%d", index)
+		}
+	})
 	m.reconcileInteraction()
 
 	for _, test := range []struct {
@@ -245,8 +251,9 @@ func TestMessageNavigationWithPathsIsNotUndoneByReconciliation(t *testing.T) {
 			updated, _ := m.Update(test.key)
 			m = updated.(Model)
 			projection := m.messageProjection()
-			if projection.SelectedPosition() != test.want || m.interaction.selectedPath != m.folders[0].Messages[test.want].Path {
-				t.Fatalf("position/path = %d/%q, want %d/%q", projection.SelectedPosition(), m.interaction.selectedPath, test.want, m.folders[0].Messages[test.want].Path)
+			messages := m.loadedFolders.messages(m.folders[0].Path)
+			if projection.SelectedPosition() != test.want || m.interaction.selectedPath != messages[test.want].Path {
+				t.Fatalf("position/path = %d/%q, want %d/%q", projection.SelectedPosition(), m.interaction.selectedPath, test.want, messages[test.want].Path)
 			}
 		})
 	}
@@ -255,8 +262,10 @@ func TestMessageNavigationWithPathsIsNotUndoneByReconciliation(t *testing.T) {
 func TestSearchQueryEditPreservesVisibleSelectedPath(t *testing.T) {
 	m := testModel()
 	m.interaction.focus = messagesPane
-	m.folders[0].Messages[0].Path = "/mail/INBOX/cur/alice"
-	m.folders[0].Messages[1].Path = "/mail/INBOX/cur/bank"
+	mutateFolderMessages(&m, 0, func(messages []message.Message) {
+		messages[0].Path = "/mail/INBOX/cur/alice"
+		messages[1].Path = "/mail/INBOX/cur/bank"
+	})
 	m.interaction.selectedPath = "/mail/INBOX/cur/bank"
 	m.reconcileInteraction()
 
@@ -276,9 +285,11 @@ func TestSearchQueryEditPreservesVisibleSelectedPath(t *testing.T) {
 func TestRichMessageIsDefaultAndCanToggleToPlainText(t *testing.T) {
 	m := testModel()
 	m.interaction.focus = readerPane
-	m.folders[0].Messages[0].Path = "/mail/INBOX/cur/1"
-	m.folders[0].Messages[0].Body = "Unique plain fallback"
-	m.folders[0].Messages[0].RichBody = "# Rich heading\n\nA **formatted** message."
+	mutateFolderMessages(&m, 0, func(messages []message.Message) {
+		messages[0].Path = "/mail/INBOX/cur/1"
+		messages[0].Body = "Unique plain fallback"
+		messages[0].RichBody = "# Rich heading\n\nA **formatted** message."
+	})
 
 	geometry := newPaneGeometry(60, 24)
 	rich := m.readerPane(geometry, m.messageProjection())
@@ -297,7 +308,7 @@ func TestRichMessageIsDefaultAndCanToggleToPlainText(t *testing.T) {
 func TestNewDefersAllFolderIO(t *testing.T) {
 	folders := []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}}
 	m := New("/network", folders)
-	if m.folders[0].Messages != nil || m.loadingFolder != "" {
+	if m.loadedFolders.hasSnapshot(folders[0].Path) || m.loadingFolder != "" {
 		t.Fatalf("New performed or started synchronous IO: %#v", m)
 	}
 	if m.Init() == nil {
@@ -315,25 +326,24 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 		reads:   reads,
 	}
 
-	folderRequest := reads.RequestFolder("/network/INBOX", false)
-	updated, cmd := m.Update(folderRequest)
+	updated, cmd := m.Update(folderReadDue{path: "/network/INBOX"})
 	m = updated.(Model)
-	if cmd == nil || m.loadingFolder != "/network/INBOX" || m.folders[0].Messages != nil {
+	if cmd == nil || m.loadingFolder != "/network/INBOX" || m.loadedFolders.hasSnapshot("/network/INBOX") {
 		t.Fatalf("folder scan did not start asynchronously: %#v", m)
 	}
 
 	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header ready"}
-	updated, _ = m.Update(readsession.FolderUpdate{Request: folderRequest, Messages: []message.Message{summary}, Done: true})
+	updated, _ = m.Update(folderReadFact{path: "/network/INBOX", messages: []message.Message{summary}, done: true})
 	m = updated.(Model)
-	if m.loadingFolder != "" || len(m.folders[0].Messages) != 1 || m.folders[0].Messages[0].LoadState() != message.LoadHeaderOnly {
+	messages := m.loadedFolders.messages("/network/INBOX")
+	if m.loadingFolder != "" || len(messages) != 1 || messages[0].LoadState() != message.LoadHeaderOnly {
 		t.Fatalf("unexpected header phase: %#v", m)
 	}
 	if !strings.Contains(m.View().Content, "Loading content") {
 		t.Fatal("reader does not expose the deferred body load")
 	}
 
-	messageRequest := reads.RequestMessage(summary)
-	updated, cmd = m.Update(messageRequest)
+	updated, cmd = m.Update(messageReadDue{summary: summary})
 	m = updated.(Model)
 	if cmd == nil || m.loadingMessage != summary.Path {
 		t.Fatalf("message load did not start asynchronously: %#v", m)
@@ -341,7 +351,7 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 	full := summary
 	full.Body = "Content arrived"
 	full = full.MarkContentReady()
-	updated, _ = m.Update(readsession.MessageUpdate{Request: messageRequest, Message: full})
+	updated, _ = m.Update(messageReadFact{path: summary.Path, message: full})
 	m = updated.(Model)
 	if m.loadingMessage != "" || !strings.Contains(m.View().Content, "Content arrived") {
 		t.Fatalf("message was not hydrated: %#v", m)
@@ -351,19 +361,19 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 func TestHydrationFailurePreservesHeadersAndDoesNotBecomeBodyContent(t *testing.T) {
 	reads := &stubReader{}
 	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header survives"}
-	request := reads.RequestMessage(summary)
 	m := Model{
-		folders:        []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{summary}}},
+		folders:        []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}},
 		loadingMessage: summary.Path,
 		width:          130,
 		height:         32,
 		reads:          reads,
 	}
+	setFolderMessages(&m, "/network/INBOX", []message.Message{summary})
 	failure := errors.New("permission denied")
 
-	updated, _ := m.Update(readsession.MessageUpdate{Request: request, Message: summary.MarkContentUnavailable(failure)})
+	updated, _ := m.Update(messageReadFact{path: summary.Path, message: summary.MarkContentUnavailable(failure)})
 	m = updated.(Model)
-	stored := m.folders[0].Messages[0]
+	stored := m.loadedFolders.messages("/network/INBOX")[0]
 	if stored.Subject != summary.Subject || stored.From != summary.From || stored.LoadState() != message.LoadContentUnavailable || stored.LoadError() != failure || stored.Body != "" {
 		t.Fatalf("stored failure = %#v", stored)
 	}
@@ -380,11 +390,12 @@ func TestInvalidHeaderIsTerminalAndRenderedSeparately(t *testing.T) {
 	failure := errors.New("malformed header")
 	invalid := (message.Message{Path: "/network/INBOX/cur/broken", Subject: "[invalid message]"}).MarkHeaderInvalid(failure)
 	m := Model{
-		folders: []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{invalid}}},
+		folders: []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}},
 		width:   130,
 		height:  32,
 		reads:   &stubReader{},
 	}
+	setFolderMessages(&m, "/network/INBOX", []message.Message{invalid})
 
 	if m.queueSelectedMessage(0) != nil {
 		t.Fatal("invalid header was scheduled for hydration")
@@ -399,7 +410,7 @@ func TestFolderNavigationIsDebounced(t *testing.T) {
 	m := Model{folders: []maildir.Folder{{Path: "/network/INBOX"}, {Path: "/network/Other"}}, reads: &stubReader{}}
 	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	m = updated.(Model)
-	if cmd == nil || m.interaction.folderCursor != 1 || m.folders[1].Messages != nil {
+	if cmd == nil || m.interaction.folderCursor != 1 || m.loadedFolders.hasSnapshot("/network/Other") {
 		t.Fatalf("folder navigation blocked or eagerly loaded: %#v", m)
 	}
 }
@@ -407,11 +418,13 @@ func TestFolderNavigationIsDebounced(t *testing.T) {
 func TestFolderNavigationSelectsFirstPathInLoadedFolder(t *testing.T) {
 	m := Model{
 		folders: []maildir.Folder{
-			{Path: "/mail/INBOX", Messages: []message.Message{{Path: "/mail/INBOX/cur/a"}}},
-			{Path: "/mail/Other", Messages: []message.Message{{Path: "/mail/Other/cur/first"}, {Path: "/mail/Other/cur/second"}}},
+			{Path: "/mail/INBOX"},
+			{Path: "/mail/Other"},
 		},
 		reads: &stubReader{},
 	}
+	setFolderMessages(&m, "/mail/INBOX", []message.Message{{Path: "/mail/INBOX/cur/a"}})
+	setFolderMessages(&m, "/mail/Other", []message.Message{{Path: "/mail/Other/cur/first"}, {Path: "/mail/Other/cur/second"}})
 	m.interaction.query = "old filter"
 	m.interaction.selectedPath = "/mail/INBOX/cur/a"
 
@@ -425,6 +438,9 @@ func TestFolderNavigationSelectsFirstPathInLoadedFolder(t *testing.T) {
 func TestRefreshKeyForcesSelectedFolderReload(t *testing.T) {
 	m := testModel()
 	m.folders[0].Path = "/network/INBOX"
+	setFolderMessages(&m, "/network/INBOX", []message.Message{
+		(message.Message{Path: "/mail/cur/alice", Subject: "First message"}).MarkContentReady(),
+	})
 
 	updated, cmd := m.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	m = updated.(Model)
@@ -457,9 +473,10 @@ func TestDuplicateReadDueIsRejectedBeforeAllocatingNewGeneration(t *testing.T) {
 
 	summary := message.Message{Path: "/network/INBOX/cur/1", Subject: "Summary"}
 	messageModel := Model{
-		folders: []maildir.Folder{{Path: "/network/INBOX", Messages: []message.Message{summary}}},
+		folders: []maildir.Folder{{Path: "/network/INBOX"}},
 		reads:   reads,
 	}
+	setFolderMessages(&messageModel, "/network/INBOX", []message.Message{summary})
 	messageDue := messageReadDue{summary: summary}
 	updated, firstCmd = messageModel.Update(messageDue)
 	messageModel = updated.(Model)
@@ -473,20 +490,19 @@ func TestDuplicateReadDueIsRejectedBeforeAllocatingNewGeneration(t *testing.T) {
 }
 
 func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
-	reads := &stubReader{}
-	request := reads.RequestFolder("/network/INBOX", false)
 	m := Model{
-		folders:       []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX", Messages: []message.Message{}}},
+		folders:       []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}},
 		loadingFolder: "/network/INBOX",
-		reads:         reads,
+		reads:         &stubReader{},
 	}
-	first := readsession.FolderUpdate{Request: request, Messages: []message.Message{{Path: "/network/INBOX/cur/1", Subject: "First batch"}}}
+	setFolderMessages(&m, "/network/INBOX", []message.Message{})
+	first := folderReadFact{path: "/network/INBOX", messages: []message.Message{{Path: "/network/INBOX/cur/1", Subject: "First batch"}}}
 	updated, _ := m.Update(first)
 	m = updated.(Model)
-	if len(m.folders[0].Messages) != 1 || m.loadingFolder == "" {
+	if len(m.loadedFolders.messages("/network/INBOX")) != 1 || m.loadingFolder == "" {
 		t.Fatalf("first batch was not progressive: %#v", m)
 	}
-	updated, _ = m.Update(readsession.FolderUpdate{Request: request, Messages: first.Messages, Done: true})
+	updated, _ = m.Update(folderReadFact{path: first.path, messages: first.messages, done: true})
 	m = updated.(Model)
 	if m.loadingFolder != "" {
 		t.Fatalf("completed batch kept loading state: %#v", m)
@@ -497,24 +513,24 @@ func TestProgressiveRefreshPreservesSelectedPathUntilFinalSnapshot(t *testing.T)
 	messageA := message.Message{Path: "/network/INBOX/cur/a", Subject: "A"}
 	messageB := message.Message{Path: "/network/INBOX/cur/b", Subject: "B"}
 	newer := message.Message{Path: "/network/INBOX/cur/new", Subject: "New"}
-	reads := &stubReader{}
-	request := reads.RequestFolder("/network/INBOX", true)
 	m := Model{
-		folders:          []maildir.Folder{{Path: "/network/INBOX", Messages: []message.Message{messageA, messageB}}},
+		folders:          []maildir.Folder{{Path: "/network/INBOX"}},
 		loadingFolder:    "/network/INBOX",
 		refreshingFolder: "/network/INBOX",
-		reads:            reads,
+		reads:            &stubReader{},
 	}
+	setFolderMessages(&m, "/network/INBOX", []message.Message{messageA, messageB})
+	m.loadedFolders.begin("/network/INBOX", true)
 	m.interaction.selectedPath = messageB.Path
 
-	updated, _ := m.Update(readsession.FolderUpdate{Request: request, Messages: []message.Message{newer}})
+	updated, _ := m.Update(folderReadFact{path: "/network/INBOX", refresh: true, messages: []message.Message{newer}})
 	m = updated.(Model)
 	if m.interaction.selectedPath != messageB.Path {
 		t.Fatalf("partial refresh replaced selected path: %#v", m.interaction)
 	}
 
-	updated, _ = m.Update(readsession.FolderUpdate{
-		Request: request, Messages: []message.Message{newer, messageA, messageB}, Done: true,
+	updated, _ = m.Update(folderReadFact{
+		path: "/network/INBOX", refresh: true, messages: []message.Message{newer, messageA, messageB}, done: true,
 	})
 	m = updated.(Model)
 	if m.interaction.selectedPath != messageB.Path || m.messageProjection().SelectedPosition() != 2 {
@@ -523,15 +539,15 @@ func TestProgressiveRefreshPreservesSelectedPathUntilFinalSnapshot(t *testing.T)
 }
 
 func TestRefreshCompletionKeepsReadErrorVisible(t *testing.T) {
-	reads := &stubReader{}
-	request := reads.RequestFolder("/network/INBOX", true)
 	m := Model{
-		folders:          []maildir.Folder{{Path: "/network/INBOX", Messages: []message.Message{}}},
+		folders:          []maildir.Folder{{Path: "/network/INBOX"}},
 		loadingFolder:    "/network/INBOX",
 		refreshingFolder: "/network/INBOX",
-		reads:            reads,
+		reads:            &stubReader{},
 	}
-	batch := readsession.FolderUpdate{Request: request, Err: errors.New("permission denied"), HadReadErrors: true, Done: true}
+	setFolderMessages(&m, "/network/INBOX", []message.Message{})
+	m.loadedFolders.begin("/network/INBOX", true)
+	batch := folderReadFact{path: "/network/INBOX", refresh: true, err: errors.New("permission denied"), hadReadErrors: true, done: true}
 	updated, _ := m.Update(batch)
 	m = updated.(Model)
 	if m.refreshingFolder != "" || !strings.Contains(m.status, "some messages could not be read") {
@@ -539,10 +555,34 @@ func TestRefreshCompletionKeepsReadErrorVisible(t *testing.T) {
 	}
 }
 
+func TestRefreshFailureRestoresLastGoodSnapshot(t *testing.T) {
+	previous := []message.Message{{Path: "/network/INBOX/cur/previous", Subject: "Previous"}}
+	m := Model{
+		folders:          []maildir.Folder{{Path: "/network/INBOX"}},
+		loadingFolder:    "/network/INBOX",
+		refreshingFolder: "/network/INBOX",
+		reads:            &stubReader{},
+	}
+	setFolderMessages(&m, "/network/INBOX", previous)
+	m.loadedFolders.begin("/network/INBOX", true)
+	m.replaceFolderMessages("/network/INBOX", []message.Message{{Path: "/network/INBOX/cur/partial", Subject: "Partial"}})
+
+	updated, _ := m.Update(folderReadFact{path: "/network/INBOX", refresh: true, fatal: true, err: errors.New("folder unavailable")})
+	m = updated.(Model)
+	if got := m.loadedFolders.messages("/network/INBOX"); !reflect.DeepEqual(got, previous) {
+		t.Fatalf("refresh failure did not restore the last good snapshot: %#v", got)
+	}
+	if m.loadedFolders.phase("/network/INBOX") != folderLoaded || m.loadingFolder != "" || m.refreshingFolder != "" || m.status != "Could not refresh the folder" {
+		t.Fatalf("refresh failure state = %#v", m)
+	}
+}
+
 func TestAttachmentPickerIsDiscoverable(t *testing.T) {
 	m := testModel()
-	m.folders[0].Messages[0].Path = "/mail/cur/1"
-	m.folders[0].Messages[0].Attachments = []message.Attachment{{Name: "invoice.pdf", MediaType: "application/pdf", Size: 4096}}
+	mutateFolderMessages(&m, 0, func(messages []message.Message) {
+		messages[0].Path = "/mail/cur/1"
+		messages[0].Attachments = []message.Attachment{{Name: "invoice.pdf", MediaType: "application/pdf", Size: 4096}}
+	})
 	updated, _ := m.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
 	m = updated.(Model)
 	if m.interaction.mode != attachmentsMode || !strings.Contains(m.View().Content, "invoice.pdf") {
@@ -555,18 +595,32 @@ func TestAttachmentPickerIsDiscoverable(t *testing.T) {
 	}
 }
 
+func TestAttachmentOpenFailureKeepsMaterializedPathVisible(t *testing.T) {
+	m := testModel()
+	m.openingAttachment = true
+	updated, _ := m.Update(attachmentOpened{
+		result: attachment.OpenResult{Path: "/cache/mailtui/attachments/invoice.pdf"},
+		err:    errors.New("xdg-open is not installed"),
+	})
+	m = updated.(Model)
+	if m.openingAttachment || !strings.Contains(m.status, "/cache/mailtui/attachments/invoice.pdf") || !strings.Contains(m.status, "could not open") {
+		t.Fatalf("partial attachment-open failure was not actionable: %#v", m)
+	}
+}
+
 func TestAsyncFolderReplacementReconcilesAttachmentPicker(t *testing.T) {
 	m := testModel()
 	m.folders[0].Path = "/mail/INBOX"
-	m.folders[0].Messages[0].Path = "/mail/INBOX/cur/1"
-	m.folders[0].Messages[0].Attachments = []message.Attachment{{Name: "invoice.pdf", MediaType: "application/pdf"}}
+	messages := m.loadedFolders.messages("/mail/INBOX")
+	messages[0].Path = "/mail/INBOX/cur/1"
+	messages[0].Attachments = []message.Attachment{{Name: "invoice.pdf", MediaType: "application/pdf"}}
+	setFolderMessages(&m, "/mail/INBOX", messages)
 	updated, _ := m.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
 	m = updated.(Model)
 	m.interaction.readerScroll = 8
 
-	request := (&stubReader{}).RequestFolder("/mail/INBOX", true)
 	replacement := []message.Message{{Path: "/mail/INBOX/cur/2", Subject: "Replacement"}}
-	updated, _ = m.Update(readsession.FolderUpdate{Request: request, Messages: replacement})
+	updated, _ = m.Update(folderReadFact{path: "/mail/INBOX", refresh: true, messages: replacement})
 	m = updated.(Model)
 	if m.interaction.mode != navigationMode || m.interaction.attachmentCursor != 0 || m.interaction.selectedPath != replacement[0].Path || m.interaction.readerScroll != 0 {
 		t.Fatalf("folder replacement left stale interaction state: %#v", m.interaction)
@@ -578,9 +632,10 @@ func TestProgressiveReplacementPreservesSelectedMessagePath(t *testing.T) {
 	messageB := (message.Message{Path: "/mail/cur/b", Subject: "B"}).MarkContentReady()
 	newer := (message.Message{Path: "/mail/cur/new", Subject: "New"}).MarkContentReady()
 	m := Model{
-		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{messageA, messageB}}},
+		folders: []maildir.Folder{{Path: "/mail"}},
 		width:   130, height: 32, reads: &stubReader{},
 	}
+	setFolderMessages(&m, "/mail", []message.Message{messageA, messageB})
 	m.interaction.selectedPath = messageB.Path
 	m.reconcileInteraction()
 	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path {
@@ -598,9 +653,10 @@ func TestSearchCancelPreservesSelectedPathAcrossReplacement(t *testing.T) {
 	messageB := (message.Message{Path: "/mail/cur/b", Subject: "Beta"}).MarkContentReady()
 	newer := (message.Message{Path: "/mail/cur/new", Subject: "Newest"}).MarkContentReady()
 	m := Model{
-		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{messageA, messageB}}},
+		folders: []maildir.Folder{{Path: "/mail"}},
 		width:   130, height: 32, reads: &stubReader{}, documents: newReaderDocuments(),
 	}
+	setFolderMessages(&m, "/mail", []message.Message{messageA, messageB})
 	m.interaction.focus = readerPane
 	m.interaction.selectedPath = messageB.Path
 	m.reconcileInteraction()
@@ -631,15 +687,15 @@ func TestSamePathHydrationInvalidatesReaderDocument(t *testing.T) {
 	path := "/mail/cur/1"
 	oldMessage := (message.Message{Path: path, Subject: "Subject", Body: "old body"}).MarkContentReady()
 	m := Model{
-		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{oldMessage}}},
+		folders: []maildir.Folder{{Path: "/mail"}},
 		width:   130, height: 32, reads: &stubReader{}, documents: newReaderDocuments(),
 	}
+	setFolderMessages(&m, "/mail", []message.Message{oldMessage})
 	if view := m.View().Content; !strings.Contains(view, "old body") {
 		t.Fatalf("old body was not rendered:\n%s", view)
 	}
 	newMessage := (message.Message{Path: path, Subject: "Subject", Body: "new body\nwith another line"}).MarkContentReady()
-	request := (&stubReader{}).RequestMessage(message.Message{Path: path})
-	updated, _ := m.Update(readsession.MessageUpdate{Request: request, Message: newMessage})
+	updated, _ := m.Update(messageReadFact{path: path, message: newMessage})
 	m = updated.(Model)
 	view := m.View().Content
 	if !strings.Contains(view, "new body") || strings.Contains(view, "old body") {
@@ -648,17 +704,27 @@ func TestSamePathHydrationInvalidatesReaderDocument(t *testing.T) {
 }
 
 func testModel() Model {
-	folders := []maildir.Folder{{
-		Name: "INBOX",
-		Messages: []message.Message{
-			(message.Message{Path: "/mail/cur/alice", From: "Alice <alice@example.com>", To: "me@example.com", Subject: "First message", Body: "Alice's message body", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local)}).MarkContentReady(),
-			(message.Message{Path: "/mail/cur/bank", From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local)}).MarkContentReady(),
-		},
-	}}
-	return Model{
-		root: "/backup/mail", folders: folders, width: 130, height: 32, reads: &stubReader{},
+	m := Model{
+		root: "/backup/mail", folders: []maildir.Folder{{Path: "/mail/INBOX", Name: "INBOX"}}, width: 130, height: 32, reads: &stubReader{},
 		documents: newReaderDocuments(),
 	}
+	setFolderMessages(&m, "/mail/INBOX", []message.Message{
+		(message.Message{Path: "/mail/cur/alice", From: "Alice <alice@example.com>", To: "me@example.com", Subject: "First message", Body: "Alice's message body", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local)}).MarkContentReady(),
+		(message.Message{Path: "/mail/cur/bank", From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local)}).MarkContentReady(),
+	})
+	return m
+}
+
+func setFolderMessages(model *Model, path string, messages []message.Message) {
+	model.loadedFolders.replace(path, messages)
+	model.loadedFolders.complete(path)
+}
+
+func mutateFolderMessages(model *Model, folderIndex int, mutate func([]message.Message)) {
+	path := model.folders[folderIndex].Path
+	messages := model.loadedFolders.messages(path)
+	mutate(messages)
+	setFolderMessages(model, path, messages)
 }
 
 type stubReader struct{ next readsession.RequestID }
