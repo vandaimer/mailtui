@@ -152,6 +152,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Could not update the local cache"
 		}
 		if path == m.selectedFolderPath() {
+			m.reconcileInteraction()
 			return m, m.queueSelectedMessage(0)
 		}
 	case messageReadDue:
@@ -374,76 +375,36 @@ func (m Model) selectedFolderLoaded() bool {
 	return len(m.folders) > 0 && m.folders[clampCursor(m.interaction.folderCursor, len(m.folders))].Messages != nil
 }
 
-func (m Model) filteredMessageIndexes() []int {
+func (m Model) messageProjection() messageProjection {
 	if len(m.folders) == 0 {
-		return nil
+		return projectMessages(nil, m.interaction.query, m.interaction.selectedPath)
 	}
 	folderIndex := clampCursor(m.interaction.folderCursor, len(m.folders))
-	if m.folders[folderIndex].Messages == nil {
-		return nil
-	}
-	messages := m.folders[folderIndex].Messages
-	query := strings.ToLower(strings.TrimSpace(m.interaction.query))
-	indexes := make([]int, 0, len(messages))
-	for index, item := range messages {
-		if query == "" || strings.Contains(strings.ToLower(strings.Join([]string{
-			item.Subject, item.From, item.To, item.Cc, item.Bcc,
-		}, "\n")), query) {
-			indexes = append(indexes, index)
-		}
-	}
-	return indexes
+	return projectMessages(m.folders[folderIndex].Messages, m.interaction.query, m.interaction.selectedPath)
 }
 
 func (m Model) selectedMessage() *message.Message {
-	if len(m.folders) == 0 {
-		return nil
-	}
-	matches := m.filteredMessageIndexes()
-	if len(matches) == 0 {
-		return nil
-	}
-	selected := clamp(m.interaction.messageCursor, 0, len(matches)-1)
-	folderIndex := clampCursor(m.interaction.folderCursor, len(m.folders))
-	return &m.folders[folderIndex].Messages[matches[selected]]
+	return m.messageProjection().Selected()
 }
 
 func (m *Model) reconcileInteraction() interactionContext {
-	for range 2 {
-		context := m.interactionContext()
-		if !m.interaction.Reconcile(context) {
-			return context
-		}
-	}
 	context := m.interactionContext()
 	m.interaction.Reconcile(context)
 	return context
 }
 
 func (m Model) interactionContext() interactionContext {
-	matches := m.filteredMessageIndexes()
+	projection := m.messageProjection()
 	context := interactionContext{
-		folderCount:    len(m.folders),
-		messageCount:   len(matches),
-		preservedIndex: -1,
-		hasFolder:      len(m.folders) > 0,
-		folderLoading:  m.loadingFolder != "",
+		folderCount:   len(m.folders),
+		messages:      projection,
+		hasFolder:     len(m.folders) > 0,
+		folderLoading: m.loadingFolder != "",
+		preserveSelectedPath: m.refreshingFolder != "" && m.refreshingFolder == m.loadingFolder &&
+			m.refreshingFolder == m.selectedFolderPath(),
 	}
-	var selected *message.Message
-	if len(m.folders) > 0 && len(matches) > 0 {
-		folderIndex := clampCursor(m.interaction.folderCursor, len(m.folders))
-		cursor := clampCursor(m.interaction.messageCursor, len(matches))
-		selected = &m.folders[folderIndex].Messages[matches[cursor]]
-		for position, messageIndex := range matches {
-			if m.folders[folderIndex].Messages[messageIndex].Path == m.interaction.selectedKey {
-				context.preservedIndex = position
-				context.preserveSelection = true
-				break
-			}
-		}
-	}
+	selected := projection.Selected()
 	if selected != nil {
-		context.selectedKey = selected.Path
 		context.canPickAttachments = selected.LoadState() == message.LoadContentReady && len(selected.Attachments) > 0
 		context.attachmentCount = len(selected.Attachments)
 		context.hasRichBody = selected.LoadState() == message.LoadContentReady && strings.TrimSpace(selected.RichBody) != ""
@@ -488,8 +449,9 @@ func (m Model) viewContent() string {
 	}
 
 	header := m.headerView()
-	foot := m.footerView()
-	body := m.bodyView(layout)
+	projection := m.messageProjection()
+	foot := m.footerView(projection)
+	body := m.bodyView(layout, projection)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, foot)
 }
 
@@ -502,12 +464,12 @@ func (m Model) headerView() string {
 	return brand + root + strings.Repeat(" ", gap) + readonly
 }
 
-func (m Model) footerView() string {
+func (m Model) footerView(projection messageProjection) string {
 	if m.interaction.mode == attachmentsMode {
 		return fitSides(accentStyle.Render("ATTACHMENTS  ↑↓ select  Enter open  Esc cancel"), mutedStyle.Render("read only"), m.width)
 	}
 	if m.interaction.mode == searchMode {
-		count := len(m.filteredMessageIndexes())
+		count := projection.Len()
 		prefix := accentStyle.Render(" / ")
 		right := mutedStyle.Render(fmt.Sprintf("%d result(s)  Enter apply  Esc cancel", count))
 		queryWidth := max(1, m.width-lipgloss.Width(prefix)-lipgloss.Width(right)-1)
@@ -533,20 +495,20 @@ func (m Model) footerView() string {
 	return fitSides(left, right, m.width)
 }
 
-func (m Model) bodyView(layout layoutPlan) string {
+func (m Model) bodyView(layout layoutPlan, projection messageProjection) string {
 	switch layout.mode {
 	case wideLayout:
 		return lipgloss.JoinHorizontal(lipgloss.Top,
 			m.folderPane(layout.folders),
-			m.messagesPane(layout.messages),
-			m.readerPane(layout.reader),
+			m.messagesPane(layout.messages, projection),
+			m.readerPane(layout.reader, projection),
 		)
 	case mediumLayout:
 		return lipgloss.JoinHorizontal(lipgloss.Top,
 			m.folderPane(layout.folders),
 			lipgloss.JoinVertical(lipgloss.Left,
-				m.messagesPane(layout.messages),
-				m.readerPane(layout.reader),
+				m.messagesPane(layout.messages, projection),
+				m.readerPane(layout.reader, projection),
 			),
 		)
 	default:
@@ -554,9 +516,9 @@ func (m Model) bodyView(layout layoutPlan) string {
 		case foldersPane:
 			return m.folderPane(layout.folders)
 		case messagesPane:
-			return m.messagesPane(layout.messages)
+			return m.messagesPane(layout.messages, projection)
 		default:
-			return m.readerPane(layout.reader)
+			return m.readerPane(layout.reader, projection)
 		}
 	}
 }
@@ -586,19 +548,18 @@ func (m Model) folderPane(geometry paneGeometry) string {
 	return paneBox("FOLDERS", fmt.Sprintf("%d", len(m.folders)), lines, geometry, m.interaction.focus == foldersPane)
 }
 
-func (m Model) messagesPane(geometry paneGeometry) string {
+func (m Model) messagesPane(geometry paneGeometry, projection messageProjection) string {
 	if !m.selectedFolderLoaded() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Loading messages"), mutedStyle.Render("Reading Maildir headers only…")}
 		return paneBox("MESSAGES", "", lines, geometry, m.interaction.focus == messagesPane)
 	}
-	matches := m.filteredMessageIndexes()
 	rowsPerMessage := 3
 	visibleCount := max(1, geometry.contentHeight/rowsPerMessage)
-	selected := clamp(m.interaction.messageCursor, 0, max(0, len(matches)-1))
-	start := clamp(selected-visibleCount/2, 0, max(0, len(matches)-visibleCount))
-	end := min(len(matches), start+visibleCount)
+	selected := max(0, projection.SelectedPosition())
+	start := clamp(selected-visibleCount/2, 0, max(0, projection.Len()-visibleCount))
+	end := min(projection.Len(), start+visibleCount)
 	var lines []string
-	if len(matches) == 0 {
+	if projection.Len() == 0 {
 		if m.interaction.query != "" {
 			lines = []string{"", accentStyle.Render("No results"), mutedStyle.Render("Try another search term.")}
 		} else {
@@ -606,7 +567,10 @@ func (m Model) messagesPane(geometry paneGeometry) string {
 		}
 	} else {
 		for position := start; position < end; position++ {
-			item := m.folders[m.interaction.folderCursor].Messages[matches[position]]
+			item := projection.Message(position)
+			if item == nil {
+				continue
+			}
 			available := geometry.contentWidth
 			first := fitSides(truncate(displaySender(item.From), max(4, available-10)), displayDate(item.Date), available)
 			second := truncate(empty(item.Subject, "(no subject)"), available)
@@ -635,11 +599,11 @@ func (m Model) messagesPane(geometry paneGeometry) string {
 	if len(m.folders) > 0 {
 		folderName = truncate(strings.ToUpper(maildir.DisplayName(m.folders[m.interaction.folderCursor].Name)), 22)
 	}
-	count := fmt.Sprintf("%d/%d", len(matches), m.folderMessageCount())
+	count := fmt.Sprintf("%d/%d", projection.Len(), m.folderMessageCount())
 	return paneBox(folderName, count, lines, geometry, m.interaction.focus == messagesPane)
 }
 
-func (m Model) readerPane(geometry paneGeometry) string {
+func (m Model) readerPane(geometry paneGeometry, projection messageProjection) string {
 	if !m.selectedFolderLoaded() {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Preparing folder"), mutedStyle.Render("The interface remains responsive while loading.")}
 		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
@@ -648,7 +612,7 @@ func (m Model) readerPane(geometry paneGeometry) string {
 		lines := []string{"", accentStyle.Render(m.spinner() + " Receiving message batches"), mutedStyle.Render(fmt.Sprintf("%d headers available so far…", m.folderMessageCount()))}
 		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
 	}
-	item := m.selectedMessage()
+	item := projection.Selected()
 	available := geometry.contentWidth
 	if item == nil {
 		lines := []string{"", accentStyle.Render("No message selected"), mutedStyle.Render("Choose a message or adjust your search.")}

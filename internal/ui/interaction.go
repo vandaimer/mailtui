@@ -22,22 +22,20 @@ type interactionState struct {
 	mode             interactionMode
 	focus            pane
 	folderCursor     int
-	messageCursor    int
 	attachmentCursor int
 	readerScroll     int
 	query            string
 	preferPlain      bool
-	selectedKey      string
+	selectedPath     string
 	attachmentKey    string
 	searchRestore    searchSnapshot
 }
 
 type searchSnapshot struct {
-	query         string
-	focus         pane
-	messageCursor int
-	readerScroll  int
-	selectedKey   string
+	query        string
+	focus        pane
+	readerScroll int
+	selectedPath string
 }
 
 type interactionInput struct {
@@ -46,19 +44,17 @@ type interactionInput struct {
 }
 
 type interactionContext struct {
-	folderCount        int
-	messageCount       int
-	selectedKey        string
-	preservedIndex     int
-	preserveSelection  bool
-	hasFolder          bool
-	folderLoading      bool
-	canPickAttachments bool
-	attachmentCount    int
-	hasRichBody        bool
-	readerBoundsValid  bool
-	readerPageRows     int
-	readerMaxScroll    int
+	folderCount          int
+	messages             messageProjection
+	hasFolder            bool
+	folderLoading        bool
+	preserveSelectedPath bool
+	canPickAttachments   bool
+	attachmentCount      int
+	hasRichBody          bool
+	readerBoundsValid    bool
+	readerPageRows       int
+	readerMaxScroll      int
 }
 
 type readTiming uint8
@@ -102,27 +98,21 @@ func (state *interactionState) Apply(input interactionInput, context interaction
 	}
 }
 
-func (state *interactionState) Reconcile(context interactionContext) bool {
+func (state *interactionState) Reconcile(context interactionContext) {
 	state.focus = pane(clamp(int(state.focus), int(foldersPane), int(readerPane)))
 	state.folderCursor = clampCursor(state.folderCursor, context.folderCount)
-	state.messageCursor = clampCursor(state.messageCursor, context.messageCount)
 	state.attachmentCursor = clampCursor(state.attachmentCursor, context.attachmentCount)
-	if state.selectedKey != "" && state.selectedKey != context.selectedKey && context.preserveSelection {
-		state.messageCursor = context.preservedIndex
-		return true
-	}
-
-	if state.selectedKey != context.selectedKey {
+	selectedPath := context.messages.SelectedPath()
+	if selectedPath != "" && state.selectedPath != selectedPath && !context.preserveSelectedPath {
 		state.readerScroll = 0
-		state.selectedKey = context.selectedKey
+		state.selectedPath = selectedPath
 	}
 	if context.readerBoundsValid {
 		state.readerScroll = clamp(state.readerScroll, 0, max(0, context.readerMaxScroll))
 	}
-	if state.mode == attachmentsMode && (!context.canPickAttachments || context.selectedKey == "" || context.selectedKey != state.attachmentKey) {
+	if state.mode == attachmentsMode && (!context.canPickAttachments || selectedPath == "" || selectedPath != state.attachmentKey) {
 		state.closeAttachments()
 	}
-	return false
 }
 
 func (state *interactionState) applySearch(input interactionInput) interactionOutcome {
@@ -134,9 +124,8 @@ func (state *interactionState) applySearch(input interactionInput) interactionOu
 	case "esc":
 		state.query = state.searchRestore.query
 		state.focus = state.searchRestore.focus
-		state.messageCursor = state.searchRestore.messageCursor
 		state.readerScroll = state.searchRestore.readerScroll
-		state.selectedKey = state.searchRestore.selectedKey
+		state.selectedPath = state.searchRestore.selectedPath
 		state.mode = navigationMode
 	case "enter":
 		state.mode = navigationMode
@@ -144,15 +133,12 @@ func (state *interactionState) applySearch(input interactionInput) interactionOu
 		if len(state.query) > 0 {
 			_, size := utf8.DecodeLastRuneInString(state.query)
 			state.query = state.query[:len(state.query)-size]
-			state.resetMessageSelection()
 		}
 	case "ctrl+u":
 		state.query = ""
-		state.resetMessageSelection()
 	default:
 		if input.text != "" {
 			state.query += input.text
-			state.resetMessageSelection()
 		}
 	}
 	outcome.messageRead = readDeferred
@@ -187,8 +173,8 @@ func (state *interactionState) applyNavigation(input interactionInput, context i
 		outcome.quit = true
 	case "/":
 		state.searchRestore = searchSnapshot{
-			query: state.query, focus: state.focus, messageCursor: state.messageCursor,
-			readerScroll: state.readerScroll, selectedKey: state.selectedKey,
+			query: state.query, focus: state.focus,
+			readerScroll: state.readerScroll, selectedPath: state.selectedPath,
 		}
 		state.mode = searchMode
 		if state.focus == foldersPane {
@@ -198,7 +184,7 @@ func (state *interactionState) applyNavigation(input interactionInput, context i
 		if context.canPickAttachments && context.attachmentCount > 0 {
 			state.mode = attachmentsMode
 			state.attachmentCursor = 0
-			state.attachmentKey = context.selectedKey
+			state.attachmentKey = context.messages.SelectedPath()
 			state.focus = readerPane
 		} else {
 			outcome.notice = noAttachmentsNotice
@@ -222,7 +208,6 @@ func (state *interactionState) applyNavigation(input interactionInput, context i
 		case context.folderLoading:
 			outcome.notice = folderBusyNotice
 		default:
-			state.resetMessageSelection()
 			outcome.refreshFolder = true
 		}
 	case "tab":
@@ -243,7 +228,6 @@ func (state *interactionState) applyNavigation(input interactionInput, context i
 	case "esc", "backspace":
 		if state.query != "" {
 			state.query = ""
-			state.resetMessageSelection()
 			outcome.messageRead = readImmediately
 		} else if state.focus > foldersPane {
 			state.focus--
@@ -279,11 +263,10 @@ func (state *interactionState) move(delta int, context interactionContext, outco
 			outcome.folderRead = readDeferred
 		}
 	case messagesPane:
-		next := clampCursor(state.messageCursor+delta, context.messageCount)
-		if next != state.messageCursor {
-			state.messageCursor = next
+		next := context.messages.Move(delta)
+		if next != "" && next != state.selectedPath {
 			state.readerScroll = 0
-			state.selectedKey = ""
+			state.selectedPath = next
 			outcome.messageRead = readDeferred
 		}
 	case readerPane:
@@ -306,14 +289,12 @@ func (state *interactionState) moveToBoundary(end bool, context interactionConte
 		state.resetMessageSelection()
 		outcome.folderRead = readDeferred
 	case messagesPane:
-		if end && context.messageCount > 0 {
-			state.messageCursor = context.messageCount - 1
-		} else {
-			state.messageCursor = 0
+		next := context.messages.Boundary(end)
+		if next != "" && next != state.selectedPath {
+			state.selectedPath = next
+			state.readerScroll = 0
+			outcome.messageRead = readDeferred
 		}
-		state.readerScroll = 0
-		state.selectedKey = ""
-		outcome.messageRead = readDeferred
 	}
 }
 
@@ -324,9 +305,8 @@ func (state *interactionState) page(direction int, context interactionContext) {
 }
 
 func (state *interactionState) resetMessageSelection() {
-	state.messageCursor = 0
 	state.readerScroll = 0
-	state.selectedKey = ""
+	state.selectedPath = ""
 }
 
 func (state *interactionState) closeAttachments() {
