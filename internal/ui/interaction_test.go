@@ -1,26 +1,40 @@
 package ui
 
-import "testing"
+import (
+	"testing"
+
+	"mailtui/internal/message"
+)
 
 func TestInteractionSearchCancelRestoresTransactionSnapshot(t *testing.T) {
-	state := interactionState{focus: readerPane, messageCursor: 2, readerScroll: 17, query: "applied", selectedKey: "message-3"}
-	context := interactionContext{folderCount: 1, messageCount: 4, selectedKey: "message-3", hasFolder: true, readerBoundsValid: true, readerPageRows: 8, readerMaxScroll: 40}
+	state := interactionState{focus: readerPane, readerScroll: 17, query: "applied", selectedPath: "message-3"}
+	context := interactionContext{
+		folderCount: 1, messages: projectionWithPaths("message-3", "message-1", "message-2", "message-3", "message-4"),
+		hasFolder: true, readerBoundsValid: true, readerPageRows: 8, readerMaxScroll: 40,
+	}
 
 	state.Apply(interactionInput{key: "/", text: "/"}, context)
 	state.Apply(interactionInput{key: "x", text: "x"}, context)
-	state.Reconcile(interactionContext{folderCount: 1, messageCount: 1, selectedKey: "draft-result", hasFolder: true, readerBoundsValid: true, readerPageRows: 8, readerMaxScroll: 30})
+	state.Reconcile(interactionContext{
+		folderCount: 1, messages: projectionWithPaths("draft-result", "draft-result"),
+		hasFolder: true, readerBoundsValid: true, readerPageRows: 8, readerMaxScroll: 30,
+	})
 	state.Apply(interactionInput{key: "esc"}, context)
 	state.Reconcile(context)
 
-	if state.mode != navigationMode || state.query != "applied" || state.focus != readerPane || state.messageCursor != 2 || state.readerScroll != 17 || state.selectedKey != "message-3" {
+	if state.mode != navigationMode || state.query != "applied" || state.focus != readerPane || state.readerScroll != 17 || state.selectedPath != "message-3" {
 		t.Fatalf("search transaction was not restored: %#v", state)
 	}
 }
 
 func TestInteractionModesAreExclusiveAndPickerOwnsKeys(t *testing.T) {
 	state := interactionState{}
-	context := interactionContext{folderCount: 1, messageCount: 1, selectedKey: "message", hasFolder: true, canPickAttachments: true, attachmentCount: 2}
+	context := interactionContext{
+		folderCount: 1, messages: projectionWithPaths("message", "message"), hasFolder: true,
+		canPickAttachments: true, attachmentCount: 2,
+	}
 
+	state.Reconcile(context)
 	state.Apply(interactionInput{key: "/", text: "/"}, context)
 	state.Apply(interactionInput{key: "o", text: "o"}, context)
 	if state.mode != searchMode || state.query != "o" {
@@ -69,24 +83,25 @@ func TestInteractionResizeReconcilesReaderBoundsBeforePaging(t *testing.T) {
 	}
 }
 
-func TestInteractionClearingAppliedQueryResetsSelectionAndScroll(t *testing.T) {
-	state := interactionState{focus: readerPane, query: "alice", messageCursor: 3, readerScroll: 22}
-	outcome := state.Apply(interactionInput{key: "esc"}, interactionContext{messageCount: 5, readerMaxScroll: 40})
-	if state.query != "" || state.messageCursor != 0 || state.readerScroll != 0 || outcome.messageRead != readImmediately {
-		t.Fatalf("query clear did not reset dependent state: state=%#v outcome=%#v", state, outcome)
+func TestInteractionClearingAppliedQueryPreservesSelectionAndScroll(t *testing.T) {
+	state := interactionState{focus: readerPane, query: "alice", readerScroll: 22, selectedPath: "message"}
+	context := interactionContext{messages: projectionWithPaths("message", "message"), readerMaxScroll: 40}
+	outcome := state.Apply(interactionInput{key: "esc"}, context)
+	if state.query != "" || state.selectedPath != "message" || state.readerScroll != 22 || outcome.messageRead != readImmediately {
+		t.Fatalf("query clear changed selection: state=%#v outcome=%#v", state, outcome)
 	}
 }
 
 func TestInteractionReconcileClosesInvalidPickerAndResetsChangedMessage(t *testing.T) {
 	state := interactionState{
-		mode: attachmentsMode, focus: readerPane, messageCursor: 4, attachmentCursor: 3,
-		readerScroll: 19, selectedKey: "old", attachmentKey: "old",
+		mode: attachmentsMode, focus: readerPane, attachmentCursor: 3,
+		readerScroll: 19, selectedPath: "old", attachmentKey: "old",
 	}
 	state.Reconcile(interactionContext{
-		folderCount: 1, messageCount: 2, selectedKey: "new", hasFolder: true,
+		folderCount: 1, messages: projectionWithPaths("new", "first", "new"), hasFolder: true,
 		canPickAttachments: false, readerBoundsValid: true, readerPageRows: 8, readerMaxScroll: 12,
 	})
-	if state.mode != navigationMode || state.messageCursor != 1 || state.attachmentCursor != 0 || state.readerScroll != 0 || state.selectedKey != "new" {
+	if state.mode != navigationMode || state.attachmentCursor != 0 || state.readerScroll != 0 || state.selectedPath != "new" {
 		t.Fatalf("async data reconciliation left invalid interaction state: %#v", state)
 	}
 }
@@ -94,10 +109,10 @@ func TestInteractionReconcileClosesInvalidPickerAndResetsChangedMessage(t *testi
 func TestInteractionReconcileClampsPickerForSameMessage(t *testing.T) {
 	state := interactionState{
 		mode: attachmentsMode, focus: readerPane, attachmentCursor: 4,
-		selectedKey: "message", attachmentKey: "message",
+		selectedPath: "message", attachmentKey: "message",
 	}
 	state.Reconcile(interactionContext{
-		messageCount: 1, selectedKey: "message", canPickAttachments: true, attachmentCount: 2,
+		messages: projectionWithPaths("message", "message"), canPickAttachments: true, attachmentCount: 2,
 	})
 	if state.mode != attachmentsMode || state.attachmentCursor != 1 {
 		t.Fatalf("picker was not clamped for the selected message: %#v", state)
@@ -105,25 +120,52 @@ func TestInteractionReconcileClampsPickerForSameMessage(t *testing.T) {
 }
 
 func TestInteractionFolderAndMessageMovesOwnResetRules(t *testing.T) {
-	state := interactionState{query: "filter", messageCursor: 2, readerScroll: 9}
-	outcome := state.Apply(interactionInput{key: "down"}, interactionContext{folderCount: 3, messageCount: 3})
-	if state.folderCursor != 1 || state.query != "" || state.messageCursor != 0 || state.readerScroll != 0 || outcome.folderRead != readDeferred {
+	state := interactionState{query: "filter", readerScroll: 9, selectedPath: "message-3"}
+	context := interactionContext{
+		folderCount: 3,
+		messages:    projectionWithPaths("message-3", "message-1", "message-2", "message-3"),
+	}
+	outcome := state.Apply(interactionInput{key: "down"}, context)
+	if state.folderCursor != 1 || state.query != "" || state.selectedPath != "" || state.readerScroll != 0 || outcome.folderRead != readDeferred {
 		t.Fatalf("folder move invariants = %#v / %#v", state, outcome)
 	}
 
 	state.focus = messagesPane
 	state.readerScroll = 7
-	outcome = state.Apply(interactionInput{key: "down"}, interactionContext{folderCount: 3, messageCount: 3})
-	if state.messageCursor != 1 || state.readerScroll != 0 || outcome.messageRead != readDeferred {
+	context.messages = projectionWithPaths("message-1", "message-1", "message-2", "message-3")
+	state.Reconcile(context)
+	outcome = state.Apply(interactionInput{key: "down"}, context)
+	if state.selectedPath != "message-2" || state.readerScroll != 0 || outcome.messageRead != readDeferred {
 		t.Fatalf("message move invariants = %#v / %#v", state, outcome)
 	}
 }
 
+func TestInteractionMessageNavigationClampsAtProjectionEdges(t *testing.T) {
+	state := interactionState{focus: messagesPane, selectedPath: "last"}
+	context := interactionContext{messages: projectionWithPaths("last", "first", "last")}
+	outcome := state.Apply(interactionInput{key: "down"}, context)
+	if state.selectedPath != "last" || outcome.messageRead != noRead {
+		t.Fatalf("navigation moved past last message: %#v / %#v", state, outcome)
+	}
+}
+
 func TestInteractionPlainPreferencePersistsAcrossMessageReconcile(t *testing.T) {
-	state := interactionState{focus: readerPane, selectedKey: "first"}
-	outcome := state.Apply(interactionInput{key: "v"}, interactionContext{selectedKey: "first", hasRichBody: true})
-	state.Reconcile(interactionContext{messageCount: 1, selectedKey: "second", hasRichBody: true, readerBoundsValid: true, readerMaxScroll: 10})
+	state := interactionState{focus: readerPane, selectedPath: "first"}
+	first := interactionContext{messages: projectionWithPaths("first", "first"), hasRichBody: true}
+	outcome := state.Apply(interactionInput{key: "v"}, first)
+	state.Reconcile(interactionContext{
+		messages: projectionWithPaths("second", "second"), hasRichBody: true,
+		readerBoundsValid: true, readerMaxScroll: 10,
+	})
 	if !state.preferPlain || outcome.notice != plainBodyNotice || state.readerScroll != 0 {
 		t.Fatalf("plain preference did not survive selection change: %#v / %#v", state, outcome)
 	}
+}
+
+func projectionWithPaths(selectedPath string, paths ...string) messageProjection {
+	messages := make([]message.Message, len(paths))
+	for index, path := range paths {
+		messages[index].Path = path
+	}
+	return projectMessages(messages, "", selectedPath)
 }

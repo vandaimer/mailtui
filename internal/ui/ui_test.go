@@ -18,18 +18,18 @@ import (
 func TestFilterMessagesSearchesHeaders(t *testing.T) {
 	m := testModel()
 	m.interaction.query = "alice"
-	matches := m.filteredMessageIndexes()
-	if len(matches) != 1 || matches[0] != 0 {
-		t.Fatalf("matches = %#v", matches)
+	projection := m.messageProjection()
+	if projection.Len() != 1 || projection.Message(0).Path != "/mail/cur/alice" {
+		t.Fatalf("projection = %#v", projection)
 	}
 	m.interaction.query = "billing@example.com"
-	matches = m.filteredMessageIndexes()
-	if len(matches) != 1 || matches[0] != 1 {
-		t.Fatalf("recipient matches = %#v", matches)
+	projection = m.messageProjection()
+	if projection.Len() != 1 || projection.Message(0).Path != "/mail/cur/bank" {
+		t.Fatalf("recipient projection = %#v", projection)
 	}
 	m.interaction.query = "missing"
-	if matches := m.filteredMessageIndexes(); len(matches) != 0 {
-		t.Fatalf("matches = %#v", matches)
+	if projection := m.messageProjection(); projection.Len() != 0 {
+		t.Fatalf("projection = %#v", projection)
 	}
 }
 
@@ -42,13 +42,35 @@ func TestSearchInteractionCanApplyAndCancel(t *testing.T) {
 	}
 	updated, _ = m.Update(tea.KeyPressMsg{Code: 'a', Text: "alice"})
 	m = updated.(Model)
-	if m.interaction.query != "alice" || len(m.filteredMessageIndexes()) != 1 {
+	if m.interaction.query != "alice" || m.messageProjection().Len() != 1 {
 		t.Fatalf("query = %q", m.interaction.query)
 	}
 	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m = updated.(Model)
 	if m.interaction.mode != navigationMode || m.interaction.query != "" {
 		t.Fatalf("search was not cancelled: %#v", m)
+	}
+}
+
+func TestSearchCancelRestoresPathFilteredOutByDraft(t *testing.T) {
+	m := testModel()
+	m.interaction.focus = readerPane
+	m.interaction.selectedPath = "/mail/cur/bank"
+	m.folders[0].Messages[1].Body = strings.Repeat("reader line\n", 80)
+	m.interaction.readerScroll = 7
+
+	updated, _ := m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyPressMsg{Code: 'a', Text: "alice"})
+	m = updated.(Model)
+	if selected := m.selectedMessage(); selected == nil || selected.Path != "/mail/cur/alice" {
+		t.Fatalf("draft did not select its first visible path: %#v", selected)
+	}
+
+	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	m = updated.(Model)
+	if selected := m.selectedMessage(); selected == nil || selected.Path != "/mail/cur/bank" || m.interaction.focus != readerPane || m.interaction.readerScroll != 7 {
+		t.Fatalf("cancel did not restore interaction state: selected=%#v interaction=%#v", selected, m.interaction)
 	}
 }
 
@@ -62,7 +84,7 @@ func TestResponsiveViews(t *testing.T) {
 	if got := lipgloss.Height(wide); got != 32 {
 		t.Fatalf("wide view height = %d", got)
 	}
-	wideBody := m.bodyView(calculateLayout(130, 32))
+	wideBody := m.bodyView(calculateLayout(130, 32), m.messageProjection())
 	if got := lipgloss.Width(wideBody); got != 130 {
 		t.Fatalf("wide body width = %d", got)
 	}
@@ -180,7 +202,7 @@ func TestHeaderAndFooterKeepLayoutChromeToOneLine(t *testing.T) {
 			if got := lipgloss.Height(m.headerView()); got != 1 {
 				t.Fatalf("header height = %d", got)
 			}
-			if got := lipgloss.Height(m.footerView()); got != 1 {
+			if got := lipgloss.Height(m.footerView(m.messageProjection())); got != 1 {
 				t.Fatalf("footer height = %d", got)
 			}
 			if got := lipgloss.Height(m.View().Content); got != m.height {
@@ -222,19 +244,20 @@ func TestMessageNavigationWithPathsIsNotUndoneByReconciliation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			updated, _ := m.Update(test.key)
 			m = updated.(Model)
-			if m.interaction.messageCursor != test.want || m.interaction.selectedKey != m.folders[0].Messages[test.want].Path {
-				t.Fatalf("cursor/key = %d/%q, want %d/%q", m.interaction.messageCursor, m.interaction.selectedKey, test.want, m.folders[0].Messages[test.want].Path)
+			projection := m.messageProjection()
+			if projection.SelectedPosition() != test.want || m.interaction.selectedPath != m.folders[0].Messages[test.want].Path {
+				t.Fatalf("position/path = %d/%q, want %d/%q", projection.SelectedPosition(), m.interaction.selectedPath, test.want, m.folders[0].Messages[test.want].Path)
 			}
 		})
 	}
 }
 
-func TestSearchQueryResetWithPathsKeepsIntentionalFirstResult(t *testing.T) {
+func TestSearchQueryEditPreservesVisibleSelectedPath(t *testing.T) {
 	m := testModel()
 	m.interaction.focus = messagesPane
 	m.folders[0].Messages[0].Path = "/mail/INBOX/cur/alice"
 	m.folders[0].Messages[1].Path = "/mail/INBOX/cur/bank"
-	m.interaction.messageCursor = 1
+	m.interaction.selectedPath = "/mail/INBOX/cur/bank"
 	m.reconcileInteraction()
 
 	updated, _ := m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
@@ -242,11 +265,11 @@ func TestSearchQueryResetWithPathsKeepsIntentionalFirstResult(t *testing.T) {
 	updated, _ = m.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	m = updated.(Model)
 
-	if len(m.filteredMessageIndexes()) != 2 {
-		t.Fatalf("query should retain both messages, got %d", len(m.filteredMessageIndexes()))
+	if m.messageProjection().Len() != 2 {
+		t.Fatalf("query should retain both messages, got %d", m.messageProjection().Len())
 	}
-	if selected := m.selectedMessage(); selected == nil || selected.Path != "/mail/INBOX/cur/alice" || m.interaction.messageCursor != 0 {
-		t.Fatalf("query reset was undone: selected=%#v interaction=%#v", selected, m.interaction)
+	if selected := m.selectedMessage(); selected == nil || selected.Path != "/mail/INBOX/cur/bank" || m.messageProjection().SelectedPosition() != 1 {
+		t.Fatalf("query edit moved visible selection: selected=%#v interaction=%#v", selected, m.interaction)
 	}
 }
 
@@ -258,14 +281,14 @@ func TestRichMessageIsDefaultAndCanToggleToPlainText(t *testing.T) {
 	m.folders[0].Messages[0].RichBody = "# Rich heading\n\nA **formatted** message."
 
 	geometry := newPaneGeometry(60, 24)
-	rich := m.readerPane(geometry)
+	rich := m.readerPane(geometry, m.messageProjection())
 	if !strings.Contains(rich, "Rich") || !strings.Contains(rich, "heading") || !strings.Contains(rich, "RICH") || strings.Contains(rich, "Unique plain fallback") {
 		t.Fatalf("rich view was not selected by default:\n%s", rich)
 	}
 
 	updated, _ := m.Update(tea.KeyPressMsg{Code: 'v', Text: "v"})
 	m = updated.(Model)
-	plain := m.readerPane(geometry)
+	plain := m.readerPane(geometry, m.messageProjection())
 	if !strings.Contains(plain, "Unique plain fallback") || !strings.Contains(plain, "PLAIN") || strings.Contains(plain, "formatted") {
 		t.Fatalf("plain view was not selected after toggle:\n%s", plain)
 	}
@@ -381,13 +404,31 @@ func TestFolderNavigationIsDebounced(t *testing.T) {
 	}
 }
 
+func TestFolderNavigationSelectsFirstPathInLoadedFolder(t *testing.T) {
+	m := Model{
+		folders: []maildir.Folder{
+			{Path: "/mail/INBOX", Messages: []message.Message{{Path: "/mail/INBOX/cur/a"}}},
+			{Path: "/mail/Other", Messages: []message.Message{{Path: "/mail/Other/cur/first"}, {Path: "/mail/Other/cur/second"}}},
+		},
+		reads: &stubReader{},
+	}
+	m.interaction.query = "old filter"
+	m.interaction.selectedPath = "/mail/INBOX/cur/a"
+
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = updated.(Model)
+	if m.interaction.folderCursor != 1 || m.interaction.query != "" || m.interaction.selectedPath != "/mail/Other/cur/first" {
+		t.Fatalf("folder navigation did not select first path: %#v", m.interaction)
+	}
+}
+
 func TestRefreshKeyForcesSelectedFolderReload(t *testing.T) {
 	m := testModel()
 	m.folders[0].Path = "/network/INBOX"
 
 	updated, cmd := m.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	m = updated.(Model)
-	if cmd == nil || m.refreshingFolder != "/network/INBOX" || m.interaction.messageCursor != 0 {
+	if cmd == nil || m.refreshingFolder != "/network/INBOX" || m.interaction.selectedPath != "/mail/cur/alice" {
 		t.Fatalf("refresh was not scheduled: %#v", m)
 	}
 	due, ok := cmd().(folderReadDue)
@@ -452,6 +493,35 @@ func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
 	}
 }
 
+func TestProgressiveRefreshPreservesSelectedPathUntilFinalSnapshot(t *testing.T) {
+	messageA := message.Message{Path: "/network/INBOX/cur/a", Subject: "A"}
+	messageB := message.Message{Path: "/network/INBOX/cur/b", Subject: "B"}
+	newer := message.Message{Path: "/network/INBOX/cur/new", Subject: "New"}
+	reads := &stubReader{}
+	request := reads.RequestFolder("/network/INBOX", true)
+	m := Model{
+		folders:          []maildir.Folder{{Path: "/network/INBOX", Messages: []message.Message{messageA, messageB}}},
+		loadingFolder:    "/network/INBOX",
+		refreshingFolder: "/network/INBOX",
+		reads:            reads,
+	}
+	m.interaction.selectedPath = messageB.Path
+
+	updated, _ := m.Update(readsession.FolderUpdate{Request: request, Messages: []message.Message{newer}})
+	m = updated.(Model)
+	if m.interaction.selectedPath != messageB.Path {
+		t.Fatalf("partial refresh replaced selected path: %#v", m.interaction)
+	}
+
+	updated, _ = m.Update(readsession.FolderUpdate{
+		Request: request, Messages: []message.Message{newer, messageA, messageB}, Done: true,
+	})
+	m = updated.(Model)
+	if m.interaction.selectedPath != messageB.Path || m.messageProjection().SelectedPosition() != 2 {
+		t.Fatalf("completed refresh moved selection: projection=%#v interaction=%#v", m.messageProjection(), m.interaction)
+	}
+}
+
 func TestRefreshCompletionKeepsReadErrorVisible(t *testing.T) {
 	reads := &stubReader{}
 	request := reads.RequestFolder("/network/INBOX", true)
@@ -498,7 +568,7 @@ func TestAsyncFolderReplacementReconcilesAttachmentPicker(t *testing.T) {
 	replacement := []message.Message{{Path: "/mail/INBOX/cur/2", Subject: "Replacement"}}
 	updated, _ = m.Update(readsession.FolderUpdate{Request: request, Messages: replacement})
 	m = updated.(Model)
-	if m.interaction.mode != navigationMode || m.interaction.attachmentCursor != 0 || m.interaction.messageCursor != 0 || m.interaction.readerScroll != 0 {
+	if m.interaction.mode != navigationMode || m.interaction.attachmentCursor != 0 || m.interaction.selectedPath != replacement[0].Path || m.interaction.readerScroll != 0 {
 		t.Fatalf("folder replacement left stale interaction state: %#v", m.interaction)
 	}
 }
@@ -511,14 +581,14 @@ func TestProgressiveReplacementPreservesSelectedMessagePath(t *testing.T) {
 		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{messageA, messageB}}},
 		width:   130, height: 32, reads: &stubReader{},
 	}
-	m.interaction.messageCursor = 1
+	m.interaction.selectedPath = messageB.Path
 	m.reconcileInteraction()
 	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path {
 		t.Fatalf("initial selection = %#v", selected)
 	}
 
 	m.replaceFolderMessages("/mail", []message.Message{newer, messageA, messageB})
-	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path || m.interaction.messageCursor != 2 {
+	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path || m.messageProjection().SelectedPosition() != 2 {
 		t.Fatalf("replacement moved selection: selected=%#v interaction=%#v", selected, m.interaction)
 	}
 }
@@ -532,7 +602,7 @@ func TestSearchCancelPreservesSelectedPathAcrossReplacement(t *testing.T) {
 		width:   130, height: 32, reads: &stubReader{}, documentCache: make(map[readerDocumentKey][]string),
 	}
 	m.interaction.focus = readerPane
-	m.interaction.messageCursor = 1
+	m.interaction.selectedPath = messageB.Path
 	m.reconcileInteraction()
 	updated, _ := m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
 	m = updated.(Model)
@@ -541,7 +611,7 @@ func TestSearchCancelPreservesSelectedPathAcrossReplacement(t *testing.T) {
 	m.replaceFolderMessages("/mail", []message.Message{newer, messageA, messageB})
 	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m = updated.(Model)
-	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path || m.interaction.messageCursor != 2 {
+	if selected := m.selectedMessage(); selected == nil || selected.Path != messageB.Path || m.messageProjection().SelectedPosition() != 2 {
 		t.Fatalf("search cancel moved selection after replacement: selected=%#v interaction=%#v", selected, m.interaction)
 	}
 }
@@ -581,8 +651,8 @@ func testModel() Model {
 	folders := []maildir.Folder{{
 		Name: "INBOX",
 		Messages: []message.Message{
-			(message.Message{From: "Alice <alice@example.com>", To: "me@example.com", Subject: "First message", Body: "Alice's message body", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local)}).MarkContentReady(),
-			(message.Message{From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local)}).MarkContentReady(),
+			(message.Message{Path: "/mail/cur/alice", From: "Alice <alice@example.com>", To: "me@example.com", Subject: "First message", Body: "Alice's message body", Date: time.Date(2026, 8, 2, 14, 0, 0, 0, time.Local)}).MarkContentReady(),
+			(message.Message{Path: "/mail/cur/bank", From: "Bank <bank@example.com>", To: "billing@example.com", Subject: "Invoice available", Body: "Your invoice has arrived.", Date: time.Date(2026, 8, 1, 9, 0, 0, 0, time.Local)}).MarkContentReady(),
 		},
 	}}
 	return Model{
