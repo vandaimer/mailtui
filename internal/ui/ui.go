@@ -66,8 +66,8 @@ func New(root string, folders []maildir.Folder) Model {
 }
 
 type attachmentOpened struct {
-	path string
-	err  error
+	result attachment.OpenResult
+	err    error
 }
 type folderReadDue struct {
 	path    string
@@ -168,9 +168,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case attachmentOpened:
 		m.openingAttachment = false
 		if value.err != nil {
-			m.status = "Could not open attachment: " + value.err.Error()
+			if value.result.Path != "" {
+				m.status = "Attachment extracted to " + value.result.Path + "; could not open it: " + value.err.Error()
+			} else {
+				m.status = "Could not open attachment: " + value.err.Error()
+			}
 		} else {
-			m.status = "Attachment opened: " + filepath.Base(value.path)
+			m.status = "Attachment opened: " + filepath.Base(value.result.Path)
 		}
 	case readsession.MessageRequest:
 		selected := m.selectedMessage()
@@ -306,11 +310,8 @@ func readMessageCmd(reader readsession.Reader, request readsession.MessageReques
 
 func openAttachmentCmd(messagePath string, index int) tea.Cmd {
 	return func() tea.Msg {
-		path, err := attachment.ExtractToCache(messagePath, index)
-		if err == nil {
-			err = attachment.OpenDefault(path)
-		}
-		return attachmentOpened{path: path, err: err}
+		result, err := attachment.Open(messagePath, index)
+		return attachmentOpened{result: result, err: err}
 	}
 }
 

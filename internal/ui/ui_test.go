@@ -11,6 +11,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"mailtui/internal/attachment"
 	"mailtui/internal/maildir"
 	"mailtui/internal/message"
 	"mailtui/internal/readsession"
@@ -602,6 +603,19 @@ func TestAttachmentPickerIsDiscoverable(t *testing.T) {
 	m = updated.(Model)
 	if cmd == nil || m.interaction.mode != navigationMode || !m.openingAttachment {
 		t.Fatalf("attachment open was not scheduled: %#v", m)
+	}
+}
+
+func TestAttachmentOpenFailureKeepsMaterializedPathVisible(t *testing.T) {
+	m := testModel()
+	m.openingAttachment = true
+	updated, _ := m.Update(attachmentOpened{
+		result: attachment.OpenResult{Path: "/cache/mailtui/attachments/invoice.pdf"},
+		err:    errors.New("xdg-open is not installed"),
+	})
+	m = updated.(Model)
+	if m.openingAttachment || !strings.Contains(m.status, "/cache/mailtui/attachments/invoice.pdf") || !strings.Contains(m.status, "could not open") {
+		t.Fatalf("partial attachment-open failure was not actionable: %#v", m)
 	}
 }
 
