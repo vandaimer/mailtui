@@ -368,269 +368,76 @@ func (m Model) View() tea.View {
 }
 
 func (m Model) viewContent() string {
-	if m.width == 0 {
-		return "Loading…"
-	}
 	layout := calculateLayout(m.width, m.height)
-	if !layout.usable {
-		return "mailtui needs a terminal of at least 42×10\npress q to quit"
-	}
-
-	header := m.headerView()
 	projection := m.messageProjection()
-	foot := m.footerView(projection)
-	body := m.bodyView(layout, projection)
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, foot)
+	return renderPresentation(m.presentationFacts(layout, projection))
 }
 
+func (m Model) presentationFacts(layout layoutPlan, projection messageProjection) presentationFacts {
+	facts := presentationFacts{
+		width: m.width, height: m.height, root: m.root, layout: layout,
+		folders: make([]presentationFolder, 0, len(m.folders)), folderCursor: m.interaction.folderCursor,
+		projection: projection, selectedFolderReady: m.selectedFolderLoaded(), selectedFolderPath: m.selectedFolderPath(),
+		focus: m.interaction.focus, mode: m.interaction.mode, query: m.interaction.query,
+		readerScroll: m.interaction.readerScroll, preferPlain: m.interaction.preferPlain,
+		attachmentCursor: m.interaction.attachmentCursor, loadingFolder: m.loadingFolder,
+		refreshingFolder: m.refreshingFolder, loadingMessage: m.loadingMessage,
+		openingAttachment: m.openingAttachment, spinnerFrame: m.spinnerFrame, status: m.status,
+		selectedMessage: projection.Selected(),
+	}
+	for _, folder := range m.folders {
+		messages := m.loadedFolders.messages(folder.Path)
+		facts.folders = append(facts.folders, presentationFolder{
+			name: maildir.DisplayName(folder.Name), path: folder.Path,
+			count: len(messages), loaded: m.loadedFolders.hasSnapshot(folder.Path), loading: folder.Path == m.loadingFolder,
+		})
+	}
+	if len(m.folders) > 0 {
+		index := clampCursor(m.interaction.folderCursor, len(m.folders))
+		facts.selectedName = maildir.DisplayName(m.folders[index].Name)
+		facts.selectedCount = len(m.loadedFolders.messages(m.folders[index].Path))
+	}
+	if layout.usable && facts.selectedMessage != nil && facts.selectedMessage.LoadState() == message.LoadContentReady && facts.mode != attachmentsMode {
+		document := m.documents.Document(facts.selectedMessage, layout.reader.contentWidth, facts.preferPlain)
+		facts.reader = readerPresentation{viewport: document.Viewport(facts.readerScroll, layout.reader.contentHeight), mode: document.mode.Label(), ready: true}
+	}
+	return facts
+}
+
+// The following small methods preserve the existing test-facing composition
+// surface while delegating all rendering to presentation facts.
 func (m Model) headerView() string {
-	brand := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(accentStrong).Padding(0, 1).Render("MAILTUI")
-	readonly := lipgloss.NewStyle().Bold(true).Foreground(cyan).Render("READ ONLY")
-	rootWidth := max(1, m.width-lipgloss.Width(brand)-lipgloss.Width(readonly)-1)
-	root := softStyle.Render(truncate("  "+singleLine(filepath.Base(m.root)), rootWidth))
-	gap := max(1, m.width-lipgloss.Width(brand)-lipgloss.Width(root)-lipgloss.Width(readonly))
-	return brand + root + strings.Repeat(" ", gap) + readonly
+	facts := m.presentationFacts(calculateLayout(m.width, m.height), m.messageProjection())
+	return (presentation{facts: facts}).header()
 }
 
 func (m Model) footerView(projection messageProjection) string {
-	if m.interaction.mode == attachmentsMode {
-		return fitSides(accentStyle.Render("ATTACHMENTS  ↑↓ select  Enter open  Esc cancel"), mutedStyle.Render("read only"), m.width)
-	}
-	if m.interaction.mode == searchMode {
-		count := projection.Len()
-		prefix := accentStyle.Render(" / ")
-		right := mutedStyle.Render(fmt.Sprintf("%d result(s)  Enter apply  Esc cancel", count))
-		queryWidth := max(1, m.width-lipgloss.Width(prefix)-lipgloss.Width(right)-1)
-		left := prefix + lipgloss.NewStyle().Foreground(textColor).Render(truncate(singleLine(m.interaction.query)+"█", queryWidth))
-		return fitSides(left, right, m.width)
-	}
-	left := softStyle.Render("Tab/←→ focus  ↑↓ navigate  / search  r refresh  v view  o attachments  Esc back")
-	if m.loadingFolder != "" {
-		activity := "Reading headers…"
-		if m.refreshingFolder == m.loadingFolder {
-			activity = "Refreshing folder…"
-		}
-		left = accentStyle.Render(m.spinner()+" "+activity) + "  " + left
-	} else if m.loadingMessage != "" {
-		left = accentStyle.Render(m.spinner()+" Reading message…") + "  " + left
-	} else if m.openingAttachment {
-		left = accentStyle.Render(m.spinner()+" Opening attachment…") + "  " + left
-	}
-	if m.status != "" {
-		left = lipgloss.NewStyle().Foreground(warning).Render("⚠ "+singleLine(m.status)) + "  " + left
-	}
-	right := mutedStyle.Render("q quit")
-	return fitSides(left, right, m.width)
+	facts := m.presentationFacts(calculateLayout(m.width, m.height), projection)
+	return (presentation{facts: facts}).footer()
 }
 
 func (m Model) bodyView(layout layoutPlan, projection messageProjection) string {
-	switch layout.mode {
-	case wideLayout:
-		return lipgloss.JoinHorizontal(lipgloss.Top,
-			m.folderPane(layout.folders),
-			m.messagesPane(layout.messages, projection),
-			m.readerPane(layout.reader, projection),
-		)
-	case mediumLayout:
-		return lipgloss.JoinHorizontal(lipgloss.Top,
-			m.folderPane(layout.folders),
-			lipgloss.JoinVertical(lipgloss.Left,
-				m.messagesPane(layout.messages, projection),
-				m.readerPane(layout.reader, projection),
-			),
-		)
-	default:
-		switch m.interaction.focus {
-		case foldersPane:
-			return m.folderPane(layout.folders)
-		case messagesPane:
-			return m.messagesPane(layout.messages, projection)
-		default:
-			return m.readerPane(layout.reader, projection)
-		}
-	}
+	facts := m.presentationFacts(layout, projection)
+	return (presentation{facts: facts}).body()
 }
 
 func (m Model) folderPane(geometry paneGeometry) string {
-	lines := make([]string, 0, len(m.folders))
-	for index, folder := range m.folders {
-		name := maildir.DisplayName(folder.Name)
-		count := ""
-		if m.loadedFolders.hasSnapshot(folder.Path) {
-			count = fmt.Sprintf(" %d", len(m.loadedFolders.messages(folder.Path)))
-		} else if folder.Path == m.loadingFolder {
-			count = " " + m.spinner()
-		}
-		line := fitSides(truncate(name, max(1, geometry.width-8)), mutedStyle.Render(count), geometry.contentWidth)
-		if index == m.interaction.folderCursor {
-			line = fillStyle(selectedStyle, "› "+line, geometry.contentWidth)
-		} else {
-			line = "  " + line
-		}
-		lines = append(lines, line)
-	}
-	if len(lines) == 0 {
-		lines = []string{mutedStyle.Render("No folders found")}
-	}
-	lines = window(lines, m.interaction.folderCursor, geometry.contentHeight)
-	return paneBox("FOLDERS", fmt.Sprintf("%d", len(m.folders)), lines, geometry, m.interaction.focus == foldersPane)
+	facts := m.presentationFacts(calculateLayout(m.width, m.height), m.messageProjection())
+	return (presentation{facts: facts}).folderPane(geometry)
 }
 
 func (m Model) messagesPane(geometry paneGeometry, projection messageProjection) string {
-	if !m.selectedFolderLoaded() {
-		lines := []string{"", accentStyle.Render(m.spinner() + " Loading messages"), mutedStyle.Render("Reading Maildir headers only…")}
-		return paneBox("MESSAGES", "", lines, geometry, m.interaction.focus == messagesPane)
-	}
-	rowsPerMessage := 3
-	visibleCount := max(1, geometry.contentHeight/rowsPerMessage)
-	selected := max(0, projection.SelectedPosition())
-	start := clamp(selected-visibleCount/2, 0, max(0, projection.Len()-visibleCount))
-	end := min(projection.Len(), start+visibleCount)
-	var lines []string
-	if projection.Len() == 0 {
-		if m.interaction.query != "" {
-			lines = []string{"", accentStyle.Render("No results"), mutedStyle.Render("Try another search term.")}
-		} else {
-			lines = []string{"", mutedStyle.Render("This folder is empty.")}
-		}
-	} else {
-		for position := start; position < end; position++ {
-			item := projection.Message(position)
-			if item == nil {
-				continue
-			}
-			available := geometry.contentWidth
-			first := fitSides(truncate(displaySender(item.From), max(4, available-10)), displayDate(item.Date), available)
-			second := truncate(empty(item.Subject, "(no subject)"), available)
-			preview := snippet(item.Body)
-			switch item.LoadState() {
-			case message.LoadHeaderOnly:
-				preview = "Select to load the preview"
-			case message.LoadHeaderInvalid:
-				preview = "Invalid message"
-			case message.LoadContentUnavailable:
-				preview = "Message content unavailable"
-			}
-			third := truncate(preview, available)
-			if position == selected {
-				lines = append(lines,
-					fillStyle(selectedStyle, first, available),
-					fillStyle(selectedStyle, second, available),
-					fillStyle(selectedStyle, third, available),
-				)
-			} else {
-				lines = append(lines, titleStyle.Render(first), second, mutedStyle.Render(third))
-			}
-		}
-	}
-	folderName := "MESSAGES"
-	if len(m.folders) > 0 {
-		folderName = truncate(strings.ToUpper(maildir.DisplayName(m.folders[m.interaction.folderCursor].Name)), 22)
-	}
-	count := fmt.Sprintf("%d/%d", projection.Len(), m.folderMessageCount())
-	return paneBox(folderName, count, lines, geometry, m.interaction.focus == messagesPane)
+	facts := m.presentationFacts(calculateLayout(m.width, m.height), projection)
+	return (presentation{facts: facts}).messagesPane(geometry)
 }
 
 func (m Model) readerPane(geometry paneGeometry, projection messageProjection) string {
-	if !m.selectedFolderLoaded() {
-		lines := []string{"", accentStyle.Render(m.spinner() + " Preparing folder"), mutedStyle.Render("The interface remains responsive while loading.")}
-		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
+	facts := m.presentationFacts(calculateLayout(m.width, m.height), projection)
+	if facts.selectedMessage != nil && facts.selectedMessage.LoadState() == message.LoadContentReady && facts.mode != attachmentsMode {
+		document := m.documents.Document(facts.selectedMessage, geometry.contentWidth, facts.preferPlain)
+		facts.reader = readerPresentation{viewport: document.Viewport(facts.readerScroll, geometry.contentHeight), mode: document.mode.Label(), ready: true}
 	}
-	if m.loadingFolder != "" && m.loadingFolder == m.selectedFolderPath() {
-		lines := []string{"", accentStyle.Render(m.spinner() + " Receiving message batches"), mutedStyle.Render(fmt.Sprintf("%d headers available so far…", m.folderMessageCount()))}
-		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
-	}
-	item := projection.Selected()
-	available := geometry.contentWidth
-	if item == nil {
-		lines := []string{"", accentStyle.Render("No message selected"), mutedStyle.Render("Choose a message or adjust your search.")}
-		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
-	}
-	if item.LoadState() == message.LoadHeaderInvalid {
-		lines := []string{"", lipgloss.NewStyle().Foreground(warning).Render("Invalid message"), mutedStyle.Render(truncate(item.LoadError().Error(), available))}
-		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
-	}
-	if item.LoadState() == message.LoadContentUnavailable {
-		lines := []string{
-			"",
-			lipgloss.NewStyle().Foreground(warning).Render("Could not load message content"),
-			mutedStyle.Render(truncate(item.LoadError().Error(), available)),
-		}
-		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
-	}
-	if item.LoadState() == message.LoadHeaderOnly {
-		lines := []string{
-			titleStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)),
-		}
-		lines = append(lines, labelValue("From", item.From, available)...)
-		lines = append(lines, labelValue("To", item.To, available)...)
-		lines = append(lines, "", accentStyle.Render(m.spinner()+" Loading content…"), mutedStyle.Render("Only this file will be read in full."))
-		return paneBox("READER", "", lines, geometry, m.interaction.focus == readerPane)
-	}
-	if m.interaction.mode == attachmentsMode {
-		return m.attachmentPickerPane(item, geometry)
-	}
-
-	document := m.documents.Document(item, available, m.interaction.preferPlain)
-	viewport := document.Viewport(m.interaction.readerScroll, geometry.contentHeight)
-	indicator := document.mode.Label()
-	if viewport.maxScroll > 0 {
-		indicator += fmt.Sprintf(" · %d%%", viewport.progress)
-	}
-	return paneBox("READER", indicator, viewport.lines, geometry, m.interaction.focus == readerPane)
-}
-
-func (m Model) attachmentPickerPane(item *message.Message, geometry paneGeometry) string {
-	available := geometry.contentWidth
-	lines := []string{mutedStyle.Render(truncate(empty(item.Subject, "(no subject)"), available)), ""}
-	for index, entry := range item.Attachments {
-		line := fitSides(truncate(entry.Name, max(4, available-12)), formatBytes(entry.Size), available)
-		if index == m.interaction.attachmentCursor {
-			line = fillStyle(selectedStyle, "› "+line, available)
-		} else {
-			line = "  " + line
-		}
-		lines = append(lines, line, mutedStyle.Render("  "+truncate(entry.MediaType, available-2)))
-	}
-	lines = window(lines, m.interaction.attachmentCursor*2+2, geometry.contentHeight)
-	return paneBox("ATTACHMENTS", fmt.Sprintf("%d", len(item.Attachments)), lines, geometry, true)
-}
-
-func paneBox(title, meta string, lines []string, geometry paneGeometry, focused bool) string {
-	heading := accentStyle.Render(" "+title) + " "
-	if meta != "" {
-		heading = fitSides(heading, mutedStyle.Render(meta+" "), geometry.innerWidth)
-	}
-	content := heading
-	if geometry.innerHeight > 1 {
-		body := strings.Join(lines, "\n")
-		content += "\n" + body
-	}
-	borderColor := muted
-	if focused {
-		borderColor = accent
-	}
-	return lipgloss.NewStyle().
-		Width(geometry.width).
-		Height(geometry.height).
-		MaxWidth(geometry.width).
-		MaxHeight(geometry.height).
-		Foreground(textColor).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Render(content)
-}
-
-func (m Model) folderMessageCount() int {
-	if len(m.folders) == 0 {
-		return 0
-	}
-	return len(m.loadedFolders.messages(m.selectedFolderPath()))
-}
-
-func (m Model) spinner() string {
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	return frames[m.spinnerFrame%len(frames)]
+	return (presentation{facts: facts}).readerPane(geometry)
 }
 
 func labelValue(label, value string, width int) []string {
@@ -671,44 +478,8 @@ func window(lines []string, selected, height int) []string {
 	return lines[start : start+height]
 }
 
-func displaySender(value string) string {
-	if before, _, found := strings.Cut(value, "<"); found && strings.TrimSpace(before) != "" {
-		return strings.Trim(strings.TrimSpace(before), "\"")
-	}
-	return empty(value, "Unknown sender")
-}
-
-func displayDate(value time.Time) string {
-	if value.IsZero() {
-		return "—"
-	}
-	now := time.Now()
-	if value.Year() == now.Year() && value.YearDay() == now.YearDay() {
-		return value.Format("15:04")
-	}
-	if value.Year() == now.Year() {
-		return value.Format("02 Jan")
-	}
-	return value.Format("02/01/06")
-}
-
-func snippet(value string) string {
-	clean := singleLine(value)
-	return empty(clean, "No text preview")
-}
-
 func singleLine(value string) string {
 	return strings.Join(strings.Fields(value), " ")
-}
-
-func formatBytes(size int) string {
-	if size < 1024 {
-		return fmt.Sprintf("%d B", size)
-	}
-	if size < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(size)/1024)
-	}
-	return fmt.Sprintf("%.1f MB", float64(size)/(1024*1024))
 }
 
 func fitSides(left, right string, width int) string {
