@@ -43,6 +43,7 @@ var (
 type Model struct {
 	root              string
 	folders           []maildir.Folder
+	loadedFolders     loadedFolderStates
 	interaction       interactionState
 	width, height     int
 	status            string
@@ -57,7 +58,7 @@ type Model struct {
 
 func New(root string, folders []maildir.Folder) Model {
 	model := Model{
-		root: root, folders: folders, reads: readsession.New(root),
+		root: root, folders: folders, loadedFolders: newLoadedFolderStates(), reads: readsession.New(root),
 		documents: newReaderDocuments(),
 	}
 	model.reconcileInteraction()
@@ -89,6 +90,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loadingFolder = value.path
+		m.loadedFolders.begin(value.path, value.refresh)
 		return m, tea.Batch(beginFolderReadCmd(m.reader(), value.path, value.refresh), spinnerCmd())
 	case readsession.FolderRequest:
 		if value.Path != m.selectedFolderPath() {
@@ -102,6 +104,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loadingFolder = value.Path
+		m.loadedFolders.begin(value.Path, value.Refresh)
 		return m, tea.Batch(readFolderCmd(m.reader(), value), spinnerCmd())
 	case readsession.FolderUpdate:
 		if value.Stale {
@@ -109,7 +112,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		path := value.Request.Path
 		if value.Fatal {
-			m.storeFolderResult(path, []message.Message{}, value.Err)
+			m.loadedFolders.fail(path, value.Err)
+			if m.loadingFolder == path {
+				m.loadingFolder = ""
+			}
+			m.reconcileInteraction()
 			if m.refreshingFolder == path {
 				m.refreshingFolder = ""
 				m.status = "Could not refresh the folder"
@@ -117,7 +124,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if value.Started {
-			m.replaceFolderMessages(path, []message.Message{})
+			if m.loadedFolders.phase(path) != folderLoading {
+				m.loadedFolders.begin(path, value.Request.Refresh)
+			}
+			m.reconcileInteraction()
 			return m, readFolderCmd(m.reader(), value.Request)
 		}
 		m.replaceFolderMessages(path, value.Messages)
@@ -127,6 +137,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !value.Done {
 			return m, readFolderCmd(m.reader(), value.Request)
 		}
+		m.loadedFolders.complete(path)
 		if m.loadingFolder == path {
 			m.loadingFolder = ""
 		}
@@ -314,41 +325,15 @@ func (m Model) reader() readsession.Reader {
 	return readsession.New(m.root)
 }
 
-func (m *Model) storeFolderResult(path string, messages []message.Message, err error) {
-	m.replaceFolderMessages(path, messages)
-	if m.loadingFolder == path {
-		m.loadingFolder = ""
-	}
-	if err != nil {
-		m.status = "Some messages could not be read"
-	} else if path == m.selectedFolderPath() {
-		m.status = ""
-	}
-}
-
 func (m *Model) replaceFolderMessages(path string, messages []message.Message) {
-	for index := range m.folders {
-		if m.folders[index].Path == path {
-			m.folders[index].Messages = messages
-			m.reconcileInteraction()
-			return
-		}
-	}
+	m.loadedFolders.replace(path, messages)
+	m.reconcileInteraction()
 }
 
 func (m *Model) storeMessageResult(result readsession.MessageUpdate) {
 	m.documents.Invalidate(result.Request.Path)
-	for folderIndex := range m.folders {
-		for messageIndex := range m.folders[folderIndex].Messages {
-			if m.folders[folderIndex].Messages[messageIndex].Path != result.Request.Path {
-				continue
-			}
-			m.folders[folderIndex].Messages[messageIndex] = result.Message
-			if result.Message.LoadState() == message.LoadContentUnavailable {
-				m.status = "Could not load a message"
-			}
-			break
-		}
+	if m.loadedFolders.replaceMessage(result.Request.Path, result.Message) && result.Message.LoadState() == message.LoadContentUnavailable {
+		m.status = "Could not load a message"
 	}
 	if m.loadingMessage == result.Request.Path {
 		m.loadingMessage = ""
@@ -364,7 +349,7 @@ func (m Model) selectedFolderPath() string {
 }
 
 func (m Model) selectedFolderLoaded() bool {
-	return len(m.folders) > 0 && m.folders[clampCursor(m.interaction.folderCursor, len(m.folders))].Messages != nil
+	return len(m.folders) > 0 && m.loadedFolders.hasSnapshot(m.selectedFolderPath())
 }
 
 func (m Model) messageProjection() messageProjection {
@@ -372,7 +357,7 @@ func (m Model) messageProjection() messageProjection {
 		return projectMessages(nil, m.interaction.query, m.interaction.selectedPath)
 	}
 	folderIndex := clampCursor(m.interaction.folderCursor, len(m.folders))
-	return projectMessages(m.folders[folderIndex].Messages, m.interaction.query, m.interaction.selectedPath)
+	return projectMessages(m.loadedFolders.messages(m.folders[folderIndex].Path), m.interaction.query, m.interaction.selectedPath)
 }
 
 func (m Model) selectedMessage() *message.Message {
@@ -513,8 +498,8 @@ func (m Model) folderPane(geometry paneGeometry) string {
 	for index, folder := range m.folders {
 		name := maildir.DisplayName(folder.Name)
 		count := ""
-		if folder.Messages != nil {
-			count = fmt.Sprintf(" %d", len(folder.Messages))
+		if m.loadedFolders.hasSnapshot(folder.Path) {
+			count = fmt.Sprintf(" %d", len(m.loadedFolders.messages(folder.Path)))
 		} else if folder.Path == m.loadingFolder {
 			count = " " + m.spinner()
 		}
@@ -679,10 +664,10 @@ func paneBox(title, meta string, lines []string, geometry paneGeometry, focused 
 }
 
 func (m Model) folderMessageCount() int {
-	if len(m.folders) == 0 || m.folders[m.interaction.folderCursor].Messages == nil {
+	if len(m.folders) == 0 {
 		return 0
 	}
-	return len(m.folders[m.interaction.folderCursor].Messages)
+	return len(m.loadedFolders.messages(m.selectedFolderPath()))
 }
 
 func (m Model) spinner() string {
