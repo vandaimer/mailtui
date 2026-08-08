@@ -19,9 +19,8 @@ import (
 )
 
 type Folder struct {
-	Path     string
-	Name     string
-	Messages []message.Message
+	Path string
+	Name string
 }
 
 func Discover(root string) ([]Folder, error) {
@@ -73,15 +72,6 @@ func IsMaildir(path string) bool {
 		}
 	}
 	return true
-}
-
-func Load(folder *Folder) error {
-	if folder.Messages != nil {
-		return nil
-	}
-	messages, err := ScanHeaders(folder.Path)
-	folder.Messages = messages
-	return err
 }
 
 type HeaderBatch struct {

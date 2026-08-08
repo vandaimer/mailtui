@@ -10,7 +10,7 @@ import (
 	"mailtui/internal/message"
 )
 
-func TestDiscoverAndLoad(t *testing.T) {
+func TestDiscover(t *testing.T) {
 	root := t.TempDir()
 	inbox := filepath.Join(root, "INBOX")
 	makeMaildir(t, inbox)
@@ -27,14 +27,25 @@ func TestDiscoverAndLoad(t *testing.T) {
 	if len(folders) != 2 || folders[0].Name != "INBOX" {
 		t.Fatalf("unexpected folders: %#v", folders)
 	}
-	if err := Load(&folders[0]); err != nil {
+	if folders[0].Path != inbox {
+		t.Fatalf("unexpected inbox path: %q", folders[0].Path)
+	}
+}
+
+func TestScanHeadersLeavesMessageBodiesUnhydrated(t *testing.T) {
+	root := t.TempDir()
+	makeMaildir(t, root)
+	raw := "From: sender@example.com\r\nSubject: Backup\r\nDate: Fri, 01 Aug 2025 12:00:00 +0200\r\n\r\nComplete"
+	if err := os.WriteFile(filepath.Join(root, "cur", "message:2,S"), []byte(raw), 0o444); err != nil {
 		t.Fatal(err)
 	}
-	if len(folders[0].Messages) != 1 || folders[0].Messages[0].Subject != "Backup" {
-		t.Fatalf("unexpected messages: %#v", folders[0].Messages)
+
+	messages, err := ScanHeaders(root)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if folders[0].Messages[0].LoadState() != message.LoadHeaderOnly || folders[0].Messages[0].Body != "" {
-		t.Fatalf("folder scan hydrated the body: %#v", folders[0].Messages[0])
+	if len(messages) != 1 || messages[0].Subject != "Backup" || messages[0].LoadState() != message.LoadHeaderOnly || messages[0].Body != "" {
+		t.Fatalf("header scan = %#v", messages)
 	}
 }
 
