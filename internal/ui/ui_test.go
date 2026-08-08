@@ -326,15 +326,14 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 		reads:   reads,
 	}
 
-	folderRequest := reads.RequestFolder("/network/INBOX", false)
-	updated, cmd := m.Update(folderRequest)
+	updated, cmd := m.Update(folderReadDue{path: "/network/INBOX"})
 	m = updated.(Model)
 	if cmd == nil || m.loadingFolder != "/network/INBOX" || m.loadedFolders.hasSnapshot("/network/INBOX") {
 		t.Fatalf("folder scan did not start asynchronously: %#v", m)
 	}
 
 	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header ready"}
-	updated, _ = m.Update(readsession.FolderUpdate{Request: folderRequest, Messages: []message.Message{summary}, Done: true})
+	updated, _ = m.Update(folderReadFact{path: "/network/INBOX", messages: []message.Message{summary}, done: true})
 	m = updated.(Model)
 	messages := m.loadedFolders.messages("/network/INBOX")
 	if m.loadingFolder != "" || len(messages) != 1 || messages[0].LoadState() != message.LoadHeaderOnly {
@@ -344,8 +343,7 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 		t.Fatal("reader does not expose the deferred body load")
 	}
 
-	messageRequest := reads.RequestMessage(summary)
-	updated, cmd = m.Update(messageRequest)
+	updated, cmd = m.Update(messageReadDue{summary: summary})
 	m = updated.(Model)
 	if cmd == nil || m.loadingMessage != summary.Path {
 		t.Fatalf("message load did not start asynchronously: %#v", m)
@@ -353,7 +351,7 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 	full := summary
 	full.Body = "Content arrived"
 	full = full.MarkContentReady()
-	updated, _ = m.Update(readsession.MessageUpdate{Request: messageRequest, Message: full})
+	updated, _ = m.Update(messageReadFact{path: summary.Path, message: full})
 	m = updated.(Model)
 	if m.loadingMessage != "" || !strings.Contains(m.View().Content, "Content arrived") {
 		t.Fatalf("message was not hydrated: %#v", m)
@@ -363,7 +361,6 @@ func TestAsyncResultsHydrateInTwoPhases(t *testing.T) {
 func TestHydrationFailurePreservesHeadersAndDoesNotBecomeBodyContent(t *testing.T) {
 	reads := &stubReader{}
 	summary := message.Message{Path: "/network/INBOX/cur/1", From: "Alice", Subject: "Header survives"}
-	request := reads.RequestMessage(summary)
 	m := Model{
 		folders:        []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}},
 		loadingMessage: summary.Path,
@@ -374,7 +371,7 @@ func TestHydrationFailurePreservesHeadersAndDoesNotBecomeBodyContent(t *testing.
 	setFolderMessages(&m, "/network/INBOX", []message.Message{summary})
 	failure := errors.New("permission denied")
 
-	updated, _ := m.Update(readsession.MessageUpdate{Request: request, Message: summary.MarkContentUnavailable(failure)})
+	updated, _ := m.Update(messageReadFact{path: summary.Path, message: summary.MarkContentUnavailable(failure)})
 	m = updated.(Model)
 	stored := m.loadedFolders.messages("/network/INBOX")[0]
 	if stored.Subject != summary.Subject || stored.From != summary.From || stored.LoadState() != message.LoadContentUnavailable || stored.LoadError() != failure || stored.Body != "" {
@@ -493,21 +490,19 @@ func TestDuplicateReadDueIsRejectedBeforeAllocatingNewGeneration(t *testing.T) {
 }
 
 func TestProgressiveFolderBatchesAppearBeforeCompletion(t *testing.T) {
-	reads := &stubReader{}
-	request := reads.RequestFolder("/network/INBOX", false)
 	m := Model{
 		folders:       []maildir.Folder{{Path: "/network/INBOX", Name: "INBOX"}},
 		loadingFolder: "/network/INBOX",
-		reads:         reads,
+		reads:         &stubReader{},
 	}
 	setFolderMessages(&m, "/network/INBOX", []message.Message{})
-	first := readsession.FolderUpdate{Request: request, Messages: []message.Message{{Path: "/network/INBOX/cur/1", Subject: "First batch"}}}
+	first := folderReadFact{path: "/network/INBOX", messages: []message.Message{{Path: "/network/INBOX/cur/1", Subject: "First batch"}}}
 	updated, _ := m.Update(first)
 	m = updated.(Model)
 	if len(m.loadedFolders.messages("/network/INBOX")) != 1 || m.loadingFolder == "" {
 		t.Fatalf("first batch was not progressive: %#v", m)
 	}
-	updated, _ = m.Update(readsession.FolderUpdate{Request: request, Messages: first.Messages, Done: true})
+	updated, _ = m.Update(folderReadFact{path: first.path, messages: first.messages, done: true})
 	m = updated.(Model)
 	if m.loadingFolder != "" {
 		t.Fatalf("completed batch kept loading state: %#v", m)
@@ -518,26 +513,24 @@ func TestProgressiveRefreshPreservesSelectedPathUntilFinalSnapshot(t *testing.T)
 	messageA := message.Message{Path: "/network/INBOX/cur/a", Subject: "A"}
 	messageB := message.Message{Path: "/network/INBOX/cur/b", Subject: "B"}
 	newer := message.Message{Path: "/network/INBOX/cur/new", Subject: "New"}
-	reads := &stubReader{}
-	request := reads.RequestFolder("/network/INBOX", true)
 	m := Model{
 		folders:          []maildir.Folder{{Path: "/network/INBOX"}},
 		loadingFolder:    "/network/INBOX",
 		refreshingFolder: "/network/INBOX",
-		reads:            reads,
+		reads:            &stubReader{},
 	}
 	setFolderMessages(&m, "/network/INBOX", []message.Message{messageA, messageB})
 	m.loadedFolders.begin("/network/INBOX", true)
 	m.interaction.selectedPath = messageB.Path
 
-	updated, _ := m.Update(readsession.FolderUpdate{Request: request, Messages: []message.Message{newer}})
+	updated, _ := m.Update(folderReadFact{path: "/network/INBOX", refresh: true, messages: []message.Message{newer}})
 	m = updated.(Model)
 	if m.interaction.selectedPath != messageB.Path {
 		t.Fatalf("partial refresh replaced selected path: %#v", m.interaction)
 	}
 
-	updated, _ = m.Update(readsession.FolderUpdate{
-		Request: request, Messages: []message.Message{newer, messageA, messageB}, Done: true,
+	updated, _ = m.Update(folderReadFact{
+		path: "/network/INBOX", refresh: true, messages: []message.Message{newer, messageA, messageB}, done: true,
 	})
 	m = updated.(Model)
 	if m.interaction.selectedPath != messageB.Path || m.messageProjection().SelectedPosition() != 2 {
@@ -546,17 +539,15 @@ func TestProgressiveRefreshPreservesSelectedPathUntilFinalSnapshot(t *testing.T)
 }
 
 func TestRefreshCompletionKeepsReadErrorVisible(t *testing.T) {
-	reads := &stubReader{}
-	request := reads.RequestFolder("/network/INBOX", true)
 	m := Model{
 		folders:          []maildir.Folder{{Path: "/network/INBOX"}},
 		loadingFolder:    "/network/INBOX",
 		refreshingFolder: "/network/INBOX",
-		reads:            reads,
+		reads:            &stubReader{},
 	}
 	setFolderMessages(&m, "/network/INBOX", []message.Message{})
 	m.loadedFolders.begin("/network/INBOX", true)
-	batch := readsession.FolderUpdate{Request: request, Err: errors.New("permission denied"), HadReadErrors: true, Done: true}
+	batch := folderReadFact{path: "/network/INBOX", refresh: true, err: errors.New("permission denied"), hadReadErrors: true, done: true}
 	updated, _ := m.Update(batch)
 	m = updated.(Model)
 	if m.refreshingFolder != "" || !strings.Contains(m.status, "some messages could not be read") {
@@ -566,19 +557,17 @@ func TestRefreshCompletionKeepsReadErrorVisible(t *testing.T) {
 
 func TestRefreshFailureRestoresLastGoodSnapshot(t *testing.T) {
 	previous := []message.Message{{Path: "/network/INBOX/cur/previous", Subject: "Previous"}}
-	reads := &stubReader{}
-	request := reads.RequestFolder("/network/INBOX", true)
 	m := Model{
 		folders:          []maildir.Folder{{Path: "/network/INBOX"}},
 		loadingFolder:    "/network/INBOX",
 		refreshingFolder: "/network/INBOX",
-		reads:            reads,
+		reads:            &stubReader{},
 	}
 	setFolderMessages(&m, "/network/INBOX", previous)
 	m.loadedFolders.begin("/network/INBOX", true)
 	m.replaceFolderMessages("/network/INBOX", []message.Message{{Path: "/network/INBOX/cur/partial", Subject: "Partial"}})
 
-	updated, _ := m.Update(readsession.FolderUpdate{Request: request, Fatal: true, Err: errors.New("folder unavailable")})
+	updated, _ := m.Update(folderReadFact{path: "/network/INBOX", refresh: true, fatal: true, err: errors.New("folder unavailable")})
 	m = updated.(Model)
 	if got := m.loadedFolders.messages("/network/INBOX"); !reflect.DeepEqual(got, previous) {
 		t.Fatalf("refresh failure did not restore the last good snapshot: %#v", got)
@@ -630,9 +619,8 @@ func TestAsyncFolderReplacementReconcilesAttachmentPicker(t *testing.T) {
 	m = updated.(Model)
 	m.interaction.readerScroll = 8
 
-	request := (&stubReader{}).RequestFolder("/mail/INBOX", true)
 	replacement := []message.Message{{Path: "/mail/INBOX/cur/2", Subject: "Replacement"}}
-	updated, _ = m.Update(readsession.FolderUpdate{Request: request, Messages: replacement})
+	updated, _ = m.Update(folderReadFact{path: "/mail/INBOX", refresh: true, messages: replacement})
 	m = updated.(Model)
 	if m.interaction.mode != navigationMode || m.interaction.attachmentCursor != 0 || m.interaction.selectedPath != replacement[0].Path || m.interaction.readerScroll != 0 {
 		t.Fatalf("folder replacement left stale interaction state: %#v", m.interaction)
@@ -707,8 +695,7 @@ func TestSamePathHydrationInvalidatesReaderDocument(t *testing.T) {
 		t.Fatalf("old body was not rendered:\n%s", view)
 	}
 	newMessage := (message.Message{Path: path, Subject: "Subject", Body: "new body\nwith another line"}).MarkContentReady()
-	request := (&stubReader{}).RequestMessage(message.Message{Path: path})
-	updated, _ := m.Update(readsession.MessageUpdate{Request: request, Message: newMessage})
+	updated, _ := m.Update(messageReadFact{path: path, message: newMessage})
 	m = updated.(Model)
 	view := m.View().Content
 	if !strings.Contains(view, "new body") || strings.Contains(view, "old body") {
