@@ -9,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"mailtui/internal/attachment"
 	"mailtui/internal/maildir"
@@ -51,19 +52,13 @@ type Model struct {
 	spinnerFrame      int
 	reads             readsession.Reader
 	openingAttachment bool
-	documentCache     map[readerDocumentKey][]string
-}
-
-type readerDocumentKey struct {
-	path  string
-	width int
-	plain bool
+	documents         readerDocuments
 }
 
 func New(root string, folders []maildir.Folder) Model {
 	model := Model{
 		root: root, folders: folders, reads: readsession.New(root),
-		documentCache: make(map[readerDocumentKey][]string),
+		documents: newReaderDocuments(),
 	}
 	model.reconcileInteraction()
 	return model
@@ -87,9 +82,6 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
 	case tea.WindowSizeMsg:
-		if m.width != value.Width {
-			m.documentCache = make(map[readerDocumentKey][]string)
-		}
 		m.width, m.height = value.Width, value.Height
 		m.reconcileInteraction()
 	case folderReadDue:
@@ -345,7 +337,7 @@ func (m *Model) replaceFolderMessages(path string, messages []message.Message) {
 }
 
 func (m *Model) storeMessageResult(result readsession.MessageUpdate) {
-	m.invalidateDocument(result.Request.Path)
+	m.documents.Invalidate(result.Request.Path)
 	for folderIndex := range m.folders {
 		for messageIndex := range m.folders[folderIndex].Messages {
 			if m.folders[folderIndex].Messages[messageIndex].Path != result.Request.Path {
@@ -422,15 +414,8 @@ func (m Model) readerMaxScroll(geometry paneGeometry, selected *message.Message)
 	if selected == nil || selected.LoadState() != message.LoadContentReady {
 		return 0
 	}
-	return max(0, len(m.readerDocumentLines(selected, geometry.contentWidth))-geometry.contentHeight)
-}
-
-func (m *Model) invalidateDocument(path string) {
-	for key := range m.documentCache {
-		if key.path == path {
-			delete(m.documentCache, key)
-		}
-	}
+	document := m.documents.Document(selected, geometry.contentWidth, m.interaction.preferPlain)
+	return document.MaxScroll(geometry.contentHeight)
 }
 
 func (m Model) View() tea.View {
@@ -643,51 +628,13 @@ func (m Model) readerPane(geometry paneGeometry, projection messageProjection) s
 		return m.attachmentPickerPane(item, geometry)
 	}
 
-	lines := m.readerDocumentLines(item, available)
-
-	maxScroll := max(0, len(lines)-geometry.contentHeight)
-	scroll := clamp(m.interaction.readerScroll, 0, maxScroll)
-	end := min(len(lines), scroll+geometry.contentHeight)
-	indicator := "PLAIN"
-	if !m.interaction.preferPlain && strings.TrimSpace(item.RichBody) != "" {
-		indicator = "RICH"
+	document := m.documents.Document(item, available, m.interaction.preferPlain)
+	viewport := document.Viewport(m.interaction.readerScroll, geometry.contentHeight)
+	indicator := document.mode.Label()
+	if viewport.maxScroll > 0 {
+		indicator += fmt.Sprintf(" · %d%%", viewport.progress)
 	}
-	if maxScroll > 0 {
-		indicator += fmt.Sprintf(" · %d%%", scroll*100/max(1, maxScroll))
-	}
-	return paneBox("READER", indicator, lines[scroll:end], geometry, m.interaction.focus == readerPane)
-}
-
-func (m Model) readerDocumentLines(item *message.Message, width int) []string {
-	key := readerDocumentKey{path: item.Path, width: width, plain: m.interaction.preferPlain}
-	if item.Path != "" && m.documentCache != nil {
-		if cached, found := m.documentCache[key]; found {
-			return cached
-		}
-	}
-	var lines []string
-	lines = append(lines, titleStyle.Render(truncate(empty(item.Subject, "(no subject)"), width)))
-	lines = append(lines, labelValue("From", item.From, width)...)
-	lines = append(lines, labelValue("To", item.To, width)...)
-	if item.Cc != "" {
-		lines = append(lines, labelValue("Cc", item.Cc, width)...)
-	}
-	if item.Bcc != "" {
-		lines = append(lines, labelValue("Bcc", item.Bcc, width)...)
-	}
-	lines = append(lines, labelValue("Date", item.DateText, width)...)
-	if len(item.Attachments) > 0 {
-		lines = append(lines, "", accentStyle.Render(fmt.Sprintf("▣ %d attachment(s)", len(item.Attachments))))
-		for _, attachment := range item.Attachments {
-			lines = append(lines, truncate(fmt.Sprintf("  %s · %s · %s", attachment.Name, attachment.MediaType, formatBytes(attachment.Size)), width))
-		}
-	}
-	lines = append(lines, "", mutedStyle.Render(strings.Repeat("─", width)), "")
-	lines = append(lines, renderMessageContent(item, width, m.interaction.preferPlain)...)
-	if item.Path != "" && m.documentCache != nil {
-		m.documentCache[key] = lines
-	}
-	return lines
+	return paneBox("READER", indicator, viewport.lines, geometry, m.interaction.focus == readerPane)
 }
 
 func (m Model) attachmentPickerPane(item *message.Message, geometry paneGeometry) string {
@@ -759,40 +706,16 @@ func labelValue(label, value string, width int) []string {
 }
 
 func wrap(value string, width int) []string {
+	width = max(1, width)
 	var output []string
 	for _, paragraph := range strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n") {
 		if paragraph == "" {
 			output = append(output, "")
 			continue
 		}
-		words := strings.Fields(paragraph)
-		line := ""
-		for _, word := range words {
-			if len([]rune(word)) > width {
-				if line != "" {
-					output = append(output, line)
-					line = ""
-				}
-				runes := []rune(word)
-				for len(runes) > width {
-					output = append(output, string(runes[:width]))
-					runes = runes[width:]
-				}
-				line = string(runes)
-				continue
-			}
-			candidate := word
-			if line != "" {
-				candidate = line + " " + word
-			}
-			if len([]rune(candidate)) > width {
-				output = append(output, line)
-				line = word
-			} else {
-				line = candidate
-			}
-		}
-		output = append(output, line)
+		wrapped := ansi.Wordwrap(paragraph, width, "")
+		wrapped = ansi.Hardwrap(wrapped, width, false)
+		output = append(output, strings.Split(wrapped, "\n")...)
 	}
 	return output
 }
@@ -861,14 +784,7 @@ func truncate(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(singleLine(value))
-	if len(runes) <= width {
-		return string(runes)
-	}
-	if width == 1 {
-		return "…"
-	}
-	return string(runes[:width-1]) + "…"
+	return ansi.Truncate(singleLine(value), width, "…")
 }
 
 func empty(value, fallback string) string {
