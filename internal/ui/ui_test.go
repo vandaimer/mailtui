@@ -599,7 +599,7 @@ func TestSearchCancelPreservesSelectedPathAcrossReplacement(t *testing.T) {
 	newer := (message.Message{Path: "/mail/cur/new", Subject: "Newest"}).MarkContentReady()
 	m := Model{
 		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{messageA, messageB}}},
-		width:   130, height: 32, reads: &stubReader{}, documentCache: make(map[readerDocumentKey][]string),
+		width:   130, height: 32, reads: &stubReader{}, documents: newReaderDocuments(),
 	}
 	m.interaction.focus = readerPane
 	m.interaction.selectedPath = messageB.Path
@@ -622,8 +622,8 @@ func TestHiddenReaderInteractionDoesNotBuildDocumentCache(t *testing.T) {
 	m.interaction.focus = foldersPane
 	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	m = updated.(Model)
-	if m.interaction.focus != messagesPane || len(m.documentCache) != 0 {
-		t.Fatalf("hidden reader built a document: focus=%v cache=%d", m.interaction.focus, len(m.documentCache))
+	if m.interaction.focus != messagesPane || m.documents.Len() != 0 {
+		t.Fatalf("hidden reader built a document: focus=%v cache=%d", m.interaction.focus, m.documents.Len())
 	}
 }
 
@@ -632,7 +632,7 @@ func TestSamePathHydrationInvalidatesReaderDocument(t *testing.T) {
 	oldMessage := (message.Message{Path: path, Subject: "Subject", Body: "old body"}).MarkContentReady()
 	m := Model{
 		folders: []maildir.Folder{{Path: "/mail", Messages: []message.Message{oldMessage}}},
-		width:   130, height: 32, reads: &stubReader{}, documentCache: make(map[readerDocumentKey][]string),
+		width:   130, height: 32, reads: &stubReader{}, documents: newReaderDocuments(),
 	}
 	if view := m.View().Content; !strings.Contains(view, "old body") {
 		t.Fatalf("old body was not rendered:\n%s", view)
@@ -657,7 +657,7 @@ func testModel() Model {
 	}}
 	return Model{
 		root: "/backup/mail", folders: folders, width: 130, height: 32, reads: &stubReader{},
-		documentCache: make(map[readerDocumentKey][]string),
+		documents: newReaderDocuments(),
 	}
 }
 
